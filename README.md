@@ -1,5 +1,7 @@
 # Quant Intelligence
 
+AI-assisted system that formulates, tests, challenges, and explains quantitative investment hypotheses using reproducible evidence.
+
 **Atelier AI — Experiment 002**
 
 > Build an AI-assisted quantitative research system that formulates, tests, challenges, and explains investment hypotheses using reproducible evidence.
