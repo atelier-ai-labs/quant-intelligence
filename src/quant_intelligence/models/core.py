@@ -42,3 +42,8 @@ class PortfolioState:
     transaction_costs_paid: float
     exposure: float
     desired_position: str
+
+@dataclass(frozen=True)
+class EquityPoint:
+    date: date
+    equity: float

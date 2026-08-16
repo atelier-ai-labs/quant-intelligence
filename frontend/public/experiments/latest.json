@@ -1,0 +1,172 @@
+{
+  "specification": {
+    "name": "SMA trend · local validation",
+    "symbol": "SYNTH",
+    "start": null,
+    "end": null,
+    "initial_capital": 10000,
+    "signal": "sma_trend",
+    "signal_parameters": { "window": 3 },
+    "execution_timing": "next_open",
+    "position_sizing": "all_cash_no_fractional_shares",
+    "transaction_cost_bps": 5.0,
+    "benchmark": "buy_and_hold",
+    "metadata": { "environment": "local-synthetic-demo", "demo": true }
+  },
+  "actual_start": "2020-01-01",
+  "actual_end": "2020-01-08",
+  "states": [
+    {
+      "date": "2020-01-01",
+      "cash": 10000,
+      "shares": 0,
+      "asset_value": 0,
+      "equity": 10000,
+      "transaction_costs_paid": 0,
+      "exposure": 0,
+      "desired_position": "CASH"
+    },
+    {
+      "date": "2020-01-02",
+      "cash": 10000,
+      "shares": 0,
+      "asset_value": 0,
+      "equity": 10000,
+      "transaction_costs_paid": 0,
+      "exposure": 0,
+      "desired_position": "CASH"
+    },
+    {
+      "date": "2020-01-03",
+      "cash": 10000,
+      "shares": 0,
+      "asset_value": 0,
+      "equity": 10000,
+      "transaction_costs_paid": 0,
+      "exposure": 0,
+      "desired_position": "CASH"
+    },
+    {
+      "date": "2020-01-04",
+      "cash": 11.008,
+      "shares": 832,
+      "asset_value": 10816,
+      "equity": 10827.008,
+      "transaction_costs_paid": 4.992,
+      "exposure": 0.9989832833,
+      "desired_position": "LONG"
+    },
+    {
+      "date": "2020-01-05",
+      "cash": 11.008,
+      "shares": 832,
+      "asset_value": 9984,
+      "equity": 9995.008,
+      "transaction_costs_paid": 4.992,
+      "exposure": 0.9988986502,
+      "desired_position": "LONG"
+    },
+    {
+      "date": "2020-01-06",
+      "cash": 9990.016,
+      "shares": 0,
+      "asset_value": 0,
+      "equity": 9990.016,
+      "transaction_costs_paid": 9.984,
+      "exposure": 0,
+      "desired_position": "CASH"
+    },
+    {
+      "date": "2020-01-07",
+      "cash": 9990.016,
+      "shares": 0,
+      "asset_value": 0,
+      "equity": 9990.016,
+      "transaction_costs_paid": 9.984,
+      "exposure": 0,
+      "desired_position": "CASH"
+    },
+    {
+      "date": "2020-01-08",
+      "cash": 3.025,
+      "shares": 713,
+      "asset_value": 10695,
+      "equity": 10698.025,
+      "transaction_costs_paid": 14.975,
+      "exposure": 0.9997172375,
+      "desired_position": "LONG"
+    }
+  ],
+  "trades": [
+    {
+      "date": "2020-01-04",
+      "symbol": "SYNTH",
+      "side": "BUY",
+      "quantity": 832,
+      "execution_price": 12,
+      "gross_notional": 9984,
+      "transaction_cost": 4.992,
+      "cash_after": 11.008,
+      "equity_after": 10827.008,
+      "reason": "signal_LONG"
+    },
+    {
+      "date": "2020-01-06",
+      "symbol": "SYNTH",
+      "side": "SELL",
+      "quantity": 832,
+      "execution_price": 12,
+      "gross_notional": 9984,
+      "transaction_cost": 4.992,
+      "cash_after": 9990.016,
+      "equity_after": 9990.016,
+      "reason": "signal_CASH"
+    },
+    {
+      "date": "2020-01-08",
+      "symbol": "SYNTH",
+      "side": "BUY",
+      "quantity": 713,
+      "execution_price": 14,
+      "gross_notional": 9982,
+      "transaction_cost": 4.991,
+      "cash_after": 3.025,
+      "equity_after": 10698.025,
+      "reason": "signal_LONG"
+    }
+  ],
+  "metrics": {
+    "total_return": 0.0698025,
+    "cagr": 10.3482763836,
+    "annualized_volatility": 0.8434303266,
+    "sharpe_ratio": 3.2536333936,
+    "maximum_drawdown": -0.0773059372,
+    "number_of_trades": 3,
+    "transaction_costs_paid": 14.975,
+    "percentage_time_invested": 0.375,
+    "risk_free_rate": 0,
+    "annualization_days": 252
+  },
+  "benchmark_metrics": {
+    "total_return": 0.4990005,
+    "cagr": 2132376.0393,
+    "annualized_volatility": 1.9169249747,
+    "sharpe_ratio": 8.5999669948,
+    "maximum_drawdown": -0.1537868866,
+    "number_of_trades": 1,
+    "transaction_costs_paid": 4.995,
+    "percentage_time_invested": 1,
+    "risk_free_rate": 0,
+    "annualization_days": 252
+  },
+  "benchmark_equity": [
+    { "date": "2020-01-01", "equity": 9995.005 },
+    { "date": "2020-01-02", "equity": 10994.005 },
+    { "date": "2020-01-03", "equity": 11993.005 },
+    { "date": "2020-01-04", "equity": 12992.005 },
+    { "date": "2020-01-05", "equity": 11993.005 },
+    { "date": "2020-01-06", "equity": 10994.005 },
+    { "date": "2020-01-07", "equity": 13991.005 },
+    { "date": "2020-01-08", "equity": 14990.005 }
+  ]
+}

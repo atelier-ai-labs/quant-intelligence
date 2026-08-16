@@ -33,6 +33,19 @@ quant-intelligence backtest --data data/SPY.csv --symbol SPY --window 200 \
 
 The CSV must contain `date,open,high,low,close,volume`. The CLI prints a concise summary and persists the full audit result as JSON.
 
+## Frontend
+
+The v0.1 experiment detail UI lives in `frontend/` and consumes an immutable persisted result JSON; it does not recalculate financial metrics. To run it locally:
+
+```bash
+cd frontend
+npm install
+cp .env.example .env.local
+npm run dev
+```
+
+Set `VITE_EXPERIMENT_RESULT_URL` to a backend-served result endpoint or static JSON file. The backend result now includes `benchmark_equity`, the dated buy-and-hold equity series required for a truthful comparison chart. No API server is included in Phase 1 yet, so a deployment must serve the persisted JSON through its own read-only route.
+
 ## Assumptions and methodology
 
 Signals for day `t` use only bars before day `t`; a 200-day SMA is calculated from closes through `t-1`, and changes execute at day `t` open. Buys use the maximum whole-share quantity affordable after the configured cost; fractional shares are disabled. Costs equal traded notional × bps / 10,000. The benchmark buys whole shares at the first selected bar's open, applies the same cost model, holds through the final close, and leaves residual cash idle.

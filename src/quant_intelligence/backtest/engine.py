@@ -1,8 +1,8 @@
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from quant_intelligence.data.validation import validate_bars
 from quant_intelligence.metrics import calculate_metrics
-from quant_intelligence.models import Bar, PortfolioState, StrategySpec, Trade
+from quant_intelligence.models import Bar, EquityPoint, PortfolioState, StrategySpec, Trade
 from quant_intelligence.portfolio import BasisPointCostModel
 
 logger = logging.getLogger(__name__)
@@ -16,17 +16,21 @@ class BacktestResult:
     trades: list[Trade]
     metrics: dict
     benchmark_metrics: dict
+    benchmark_equity: list[EquityPoint]
 
-def buy_and_hold(bars: list[Bar], initial_capital: float, cost_model: BasisPointCostModel) -> dict:
+def buy_and_hold(bars: list[Bar], initial_capital: float, cost_model: BasisPointCostModel) -> tuple[dict, list[EquityPoint]]:
     price = bars[0].open
     shares = int(initial_capital / (price * (1 + cost_model.bps / 10_000)))
     cost = cost_model.cost(shares * price)
     cash = initial_capital - shares * price - cost
     equity = [cash + shares * bar.close for bar in bars]
-    return calculate_metrics(equity, initial_capital, cost, 1 if shares else 0, len(bars))
+    return calculate_metrics(equity, initial_capital, cost, 1 if shares else 0, len(bars) if shares else 0), [EquityPoint(bar.date, value) for bar, value in zip(bars, equity)]
 
 def run_backtest(bars: list[Bar], specification: StrategySpec, strategy) -> BacktestResult:
     bars = validate_bars(bars)
+    expected_window = specification.signal_parameters.get("window")
+    if specification.signal != "sma_trend" or not hasattr(strategy, "window") or strategy.window != expected_window:
+        raise ValueError("runtime strategy does not match StrategySpec")
     selected = [b for b in bars if (specification.start is None or b.date >= specification.start) and (specification.end is None or b.date <= specification.end)]
     if not selected: raise ValueError("no bars in requested date range")
     cost_model = BasisPointCostModel(specification.transaction_cost_bps)
@@ -52,5 +56,5 @@ def run_backtest(bars: list[Bar], specification: StrategySpec, strategy) -> Back
         states.append(PortfolioState(bar.date, cash, shares, asset_value, equity, paid, asset_value / equity if equity else 0, desired))
     logger.info("experiment_completed", extra={"symbol": specification.symbol, "trades": len(trades)})
     metrics = calculate_metrics(equity_series, specification.initial_capital, paid, len(trades), invested_days)
-    benchmark = buy_and_hold(selected, specification.initial_capital, cost_model)
-    return BacktestResult(specification, str(selected[0].date), str(selected[-1].date), states, trades, metrics, benchmark)
+    benchmark, benchmark_equity = buy_and_hold(selected, specification.initial_capital, cost_model)
+    return BacktestResult(specification, str(selected[0].date), str(selected[-1].date), states, trades, metrics, benchmark, benchmark_equity)
