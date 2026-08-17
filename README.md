@@ -33,9 +33,18 @@ quant-intelligence backtest --data data/SPY.csv --symbol SPY --window 200 \
 
 The CSV must contain `date,open,high,low,close,volume`. The CLI prints a concise summary and persists the full audit result as JSON.
 
-## Frontend
+## Application API and frontend
 
-The v0.1 experiment detail UI lives in `frontend/` and consumes an immutable persisted result JSON; it does not recalculate financial metrics. To run it locally:
+The v0.1 API lives inside the Python package and provides a thin application boundary over the existing engine. It uses a filesystem-backed `experiments/` store, exposes only health/list/detail/create endpoints, and does not recalculate financial metrics. The frontend now reads experiment summaries and canonical results through this API rather than fetching persisted JSON directly.
+
+Start the API from the repository root:
+
+```bash
+source .venv/bin/activate
+uvicorn quant_intelligence.api.main:app --reload
+```
+
+Then run the frontend:
 
 ```bash
 cd frontend
@@ -44,7 +53,33 @@ cp .env.example .env.local
 npm run dev
 ```
 
-Set `VITE_EXPERIMENT_RESULT_URL` to a backend-served result endpoint or static JSON file. The backend result now includes `benchmark_equity`, the dated buy-and-hold equity series required for a truthful comparison chart. No API server is included in Phase 1 yet, so a deployment must serve the persisted JSON through its own read-only route.
+The API allows only the local Vite origins (`localhost:5173` and `127.0.0.1:5173`) through CORS. Set `VITE_API_BASE_URL` only when the API is hosted on a different origin; same-host local development uses the empty default. The frontend selects the newest persisted experiment from `GET /api/experiments`, then retrieves its canonical result from `GET /api/experiments/{experiment_id}`.
+
+Create an experiment through the API with a local CSV:
+
+```bash
+curl -X POST http://localhost:8000/api/experiments \
+  -H 'Content-Type: application/json' \
+  -d '{"symbol":"SPY","strategy":"sma_trend","parameters":{"window":200},"start":"2015-01-01","end":"2025-12-31","initial_capital":10000,"transaction_cost_bps":5,"benchmark":"buy_and_hold","data_path":"./data/spy.csv"}'
+```
+
+The backend result includes `benchmark_equity`, the dated buy-and-hold equity series required for a truthful comparison chart. The application remains intentionally local and filesystem-backed; no database or background job system is included.
+
+## Paper Trader v0.1
+
+The first paper-trading cycle is available as a deterministic CLI command. It uses completed local CSV bars, the existing SMA strategy, a fail-closed risk gate, an in-memory `PaperBroker`, and a JSON audit record. It does not schedule itself and does not connect to a brokerage.
+
+```bash
+source .venv/bin/activate
+quant-intelligence paper-cycle \
+  --data tests/fixtures/paper_cycle.csv \
+  --symbol SYNTH --window 3 --initial-capital 1000 \
+  --transaction-cost-bps 0 \
+  --audit-dir /tmp/quant-intelligence-paper-audit \
+  --timestamp 2020-01-04T12:00:00+00:00
+```
+
+The fixture produces a BUY for 76 whole shares at the completed close of 13, passes the risk gate, fills in the paper broker, leaves $12 cash, and persists the full decision record plus broker state under the audit directory. Repeating the same cycle identity returns the prior decision rather than submitting a second order.
 
 ## Assumptions and methodology
 

@@ -60,3 +60,19 @@ export interface BacktestResult {
   benchmark_metrics: Metrics;
   benchmark_equity: EquityPoint[];
 }
+
+export interface ExperimentSummary {
+  experiment_id: string;
+  symbol: string;
+  strategy: string;
+  parameters: Record<string, unknown>;
+  requested_start: string | null;
+  requested_end: string | null;
+  actual_start: string;
+  actual_end: string;
+  initial_capital: number;
+  total_return: number | null;
+  benchmark: string;
+  created_at: string | null;
+  package_version: string | null;
+}

@@ -1,7 +1,7 @@
 import hashlib
 import json
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from quant_intelligence import __version__
@@ -10,15 +10,15 @@ from quant_intelligence.models import EquityPoint, PortfolioState, StrategySpec,
 
 SCHEMA_VERSION = "1.1"
 
-def _metadata(result: BacktestResult, source_data_sha256: str | None) -> dict[str, Any]:
-    return {"schema_version": SCHEMA_VERSION, "package_version": __version__, "strategy_implementation": "quant_intelligence.strategies.SmaTrendStrategy", "source_data_sha256": source_data_sha256, "benchmark": result.specification.benchmark}
+def _metadata(result: BacktestResult, source_data_sha256: str | None, experiment_id: str | None, created_at: str | None) -> dict[str, Any]:
+    return {"schema_version": SCHEMA_VERSION, "package_version": __version__, "strategy_implementation": "quant_intelligence.strategies.SmaTrendStrategy", "source_data_sha256": source_data_sha256, "benchmark": result.specification.benchmark, "experiment_id": experiment_id, "created_at": created_at or datetime.now(timezone.utc).isoformat()}
 
-def save_result(result: BacktestResult, path: str | Path, source_data: bytes | None = None) -> Path:
+def save_result(result: BacktestResult, path: str | Path, source_data: bytes | None = None, experiment_id: str | None = None, created_at: str | None = None) -> Path:
     target = Path(path); target.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(result)
     payload["specification"]["start"] = result.specification.start.isoformat() if result.specification.start else None
     payload["specification"]["end"] = result.specification.end.isoformat() if result.specification.end else None
-    payload["metadata"] = _metadata(result, hashlib.sha256(source_data).hexdigest() if source_data is not None else None)
+    payload["metadata"] = _metadata(result, hashlib.sha256(source_data).hexdigest() if source_data is not None else None, experiment_id, created_at)
     target.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     return target
 

@@ -108,6 +108,12 @@ def test_persistence_round_trip_and_audit_metadata(tmp_path):
     source = b"synthetic-source-v1"
     path = save_result(result, tmp_path / "result.json", source_data=source)
     payload = json.loads(path.read_text())
-    assert payload["metadata"] == {"schema_version": SCHEMA_VERSION, "package_version": __version__, "strategy_implementation": "quant_intelligence.strategies.SmaTrendStrategy", "source_data_sha256": hashlib.sha256(source).hexdigest(), "benchmark": "buy_and_hold"}
+    assert payload["metadata"]["schema_version"] == SCHEMA_VERSION
+    assert payload["metadata"]["package_version"] == __version__
+    assert payload["metadata"]["strategy_implementation"] == "quant_intelligence.strategies.SmaTrendStrategy"
+    assert payload["metadata"]["source_data_sha256"] == hashlib.sha256(source).hexdigest()
+    assert payload["metadata"]["benchmark"] == "buy_and_hold"
+    assert payload["metadata"]["experiment_id"] is None
+    assert payload["metadata"]["created_at"]
     loaded = load_result(path)
     assert asdict(loaded) == asdict(result)
