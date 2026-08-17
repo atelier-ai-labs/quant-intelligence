@@ -8,7 +8,7 @@ AI-assisted system that formulates, tests, challenges, and explains quantitative
 
 ## Status
 
-Phase 1 foundation. This repository contains deterministic backtesting infrastructure only. No AI, LLM, trading, brokerage, authentication, or live-data automation is included.
+Phase 1 research foundation plus a deterministic, local paper trader. No live-money trading, brokerage credentials, authentication, or live-data automation is included.
 
 ## Scope and architecture
 
@@ -65,6 +65,19 @@ curl -X POST http://localhost:8000/api/experiments \
 
 The backend result includes `benchmark_equity`, the dated buy-and-hold equity series required for a truthful comparison chart. The application remains intentionally local and filesystem-backed; no database or background job system is included.
 
+### Trader Operations Dashboard
+
+The React application includes a read-only `Trader` view. It observes the local paper trader through:
+
+```text
+GET /api/trader/status
+GET /api/trader/portfolio
+GET /api/trader/decisions?limit=25
+GET /api/trader/decisions/{cycle_id}
+```
+
+The API reads the persisted `paper_audit/` records by default. Set `QI_PAPER_AUDIT_DIR` and `QI_PAPER_BROKER_STATE` when the paper trader uses another local directory. The dashboard polls status, portfolio, and recent decisions every 15 seconds. It has no order-entry controls and does not calculate signals, risk, fills, portfolio values, returns, or P&L.
+
 ## Paper Trader v0.1
 
 The first paper-trading cycle is available as a deterministic CLI command. It uses completed local CSV bars, the existing SMA strategy, a fail-closed risk gate, an in-memory `PaperBroker`, and a JSON audit record. It does not schedule itself and does not connect to a brokerage.
@@ -80,6 +93,17 @@ quant-intelligence paper-cycle \
 ```
 
 The fixture produces a BUY for 76 whole shares at the completed close of 13, passes the risk gate, fills in the paper broker, leaves $12 cash, and persists the full decision record plus broker state under the audit directory. Repeating the same cycle identity returns the prior decision rather than submitting a second order.
+
+For a finite scheduled run, use `paper-run`. It defaults to one scheduled cycle; `--cycles` makes the run explicitly bounded and Ctrl+C stops it cleanly:
+
+```bash
+quant-intelligence paper-run \
+  --data tests/fixtures/paper_cycle.csv \
+  --symbol SYNTH --window 3 --initial-capital 1000 \
+  --transaction-cost-bps 0 --cycles 1
+```
+
+The scheduler, clock, autonomous trader, and status persistence live under `quant_intelligence.trading`. They orchestrate `TradingCycleService`; they do not contain strategy or accounting logic.
 
 ## Assumptions and methodology
 

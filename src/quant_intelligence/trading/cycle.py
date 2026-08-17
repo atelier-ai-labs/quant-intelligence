@@ -1,19 +1,23 @@
 import hashlib
 import json
-from datetime import datetime, timezone
+import logging
+from datetime import datetime
 from typing import Any
 
 from quant_intelligence.portfolio import BasisPointCostModel
 from quant_intelligence.strategies import SmaTrendStrategy
 from .audit import TradingAuditStore
 from .broker import Broker, BrokerError
+from .clock import Clock, SystemClock
 from .market import MarketDataProvider, MarketDataUnavailable
 from .models import OrderIntent, PortfolioSnapshot, RiskDecision, SignalAction, TradingDecision
 from .risk import RiskGate
 
+logger = logging.getLogger(__name__)
+
 class TradingCycleService:
-    def __init__(self, *, strategy: SmaTrendStrategy, broker: Broker, market_data: MarketDataProvider, risk_gate: RiskGate, audit_store: TradingAuditStore, strategy_name: str = "sma_trend", strategy_version: str = "1"):
-        self.strategy = strategy; self.broker = broker; self.market_data = market_data; self.risk_gate = risk_gate; self.audit_store = audit_store; self.strategy_name = strategy_name; self.strategy_version = strategy_version
+    def __init__(self, *, strategy: SmaTrendStrategy, broker: Broker, market_data: MarketDataProvider, risk_gate: RiskGate, audit_store: TradingAuditStore, strategy_name: str = "sma_trend", strategy_version: str = "1", clock: Clock | None = None):
+        self.strategy = strategy; self.broker = broker; self.market_data = market_data; self.risk_gate = risk_gate; self.audit_store = audit_store; self.strategy_name = strategy_name; self.strategy_version = strategy_version; self.clock = clock or SystemClock()
 
     def _cycle_id(self, symbol: str, data_timestamp: datetime) -> str:
         raw = json.dumps({"strategy": self.strategy_name, "version": self.strategy_version, "symbol": symbol, "data_timestamp": data_timestamp.isoformat(), "window": self.strategy.window}, sort_keys=True)
@@ -23,14 +27,16 @@ class TradingCycleService:
         return self.broker.get_portfolio_snapshot({symbol: price}, timestamp)
 
     def run(self, symbol: str, now: datetime | None = None) -> TradingDecision:
-        timestamp = now or datetime.now(timezone.utc)
+        timestamp = now or self.clock.now()
         try:
             market = self.market_data.get_completed_bars(symbol, timestamp)
         except (MarketDataUnavailable, ValueError) as exc:
             return self._save_no_trade(symbol, timestamp, "HOLD", f"market data unavailable: {exc}", str(exc))
         cycle_id = self._cycle_id(symbol, market.data_timestamp)
         existing = self.audit_store.get(cycle_id)
-        if existing is not None: return existing
+        if existing is not None:
+            logger.info("duplicate_cycle", extra={"cycle_id": cycle_id, "symbol": symbol})
+            return existing
         try:
             before = self._snapshot(symbol, market.latest_price, timestamp)
         except Exception as exc:

@@ -37,3 +37,19 @@ class FixtureMarketDataProvider:
 
     def is_fresh(self, snapshot: MarketDataSnapshot, now: datetime) -> bool:
         return now - snapshot.data_timestamp <= self.max_age
+
+class SequencedFixtureMarketDataProvider(FixtureMarketDataProvider):
+    """Deterministic provider that reveals completed bars as a simulation advances."""
+    def __init__(self, symbol: str, bars: list[Bar], **kwargs):
+        super().__init__(symbol, bars, **kwargs)
+        self.available_count = 0
+
+    def advance(self, count: int) -> None:
+        if not 0 < count <= len(self.bars): raise ValueError("available bar count is out of range")
+        self.available_count = count
+
+    def get_completed_bars(self, symbol: str, now: datetime) -> MarketDataSnapshot:
+        if self.available_count == 0: raise MarketDataUnavailable("no completed bars available")
+        visible = self.bars[:self.available_count]
+        timestamp = datetime.combine(visible[-1].date, datetime.min.time(), tzinfo=timezone.utc)
+        return MarketDataSnapshot(symbol, visible, timestamp, now)

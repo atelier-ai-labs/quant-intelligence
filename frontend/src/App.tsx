@@ -1,9 +1,17 @@
 import { useEffect, useState } from "react";
 import { fetchExperimentSummaries } from "./data/result";
 import { ExperimentDetailPage } from "./pages/ExperimentDetailPage";
+import { TraderDashboardPage } from "./pages/TraderDashboardPage";
 import "./styles.css";
 
 export function App() {
+  const [view, setView] = useState<"research" | "trader">(() =>
+    window.location.hash === "#trader" ? "trader" : "research",
+  );
+  const navigate = (next: "research" | "trader") => {
+    window.location.hash = next === "trader" ? "trader" : "research";
+    setView(next);
+  };
   return (
     <>
       <nav className="topbar">
@@ -11,8 +19,22 @@ export function App() {
         <span className="brand-name">Atelier AI</span>
         <span className="nav-divider">/</span>
         <span className="nav-context">Quant Intelligence</span>
+        <div className="nav-actions">
+          <button
+            className={view === "research" ? "nav-button active" : "nav-button"}
+            onClick={() => navigate("research")}
+          >
+            Research
+          </button>
+          <button
+            className={view === "trader" ? "nav-button active" : "nav-button"}
+            onClick={() => navigate("trader")}
+          >
+            Trader
+          </button>
+        </div>
       </nav>
-      <ExperimentRoute />
+      {view === "trader" ? <TraderDashboardPage /> : <ExperimentRoute />}
     </>
   );
 }
