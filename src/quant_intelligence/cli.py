@@ -2,7 +2,7 @@ import argparse
 import json
 import logging
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from quant_intelligence.backtest import run_backtest
@@ -14,6 +14,9 @@ from quant_intelligence.trading import AutonomousTrader, IntervalScheduler, Pape
 from quant_intelligence.trading.audit import TradingAuditStore
 from quant_intelligence.trading.market import FixtureMarketDataProvider
 from quant_intelligence.trading.risk import RiskGate
+from quant_intelligence.trading.alpaca import AlpacaBroker, AlpacaConfig, AlpacaConfigurationError, AlpacaMarketDataProvider
+from quant_intelligence.trading.broker import BrokerError
+from quant_intelligence.trading.reconciliation import BrokerReconciliation
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="quant-intelligence")
@@ -33,6 +36,11 @@ def main() -> None:
     r.add_argument("--symbol", default="SPY"); r.add_argument("--window", type=int, default=200)
     r.add_argument("--initial-capital", type=float, default=10_000); r.add_argument("--transaction-cost-bps", type=float, default=5)
     r.add_argument("--audit-dir", default="paper_audit"); r.add_argument("--interval-seconds", type=float, default=86400); r.add_argument("--cycles", type=int, default=1, help="finite number of scheduled cycles; defaults to one")
+    d = sub.add_parser("alpaca-data-check")
+    d.add_argument("--symbol", default="SPY"); d.add_argument("--window", type=int, default=200)
+    a = sub.add_parser("alpaca-cycle")
+    a.add_argument("--symbol", default="SPY"); a.add_argument("--window", type=int, default=200); a.add_argument("--audit-dir", default="alpaca_audit"); a.add_argument("--max-order-shares", type=int, help="explicit execution cap, intended for the one-share smoke test"); a.add_argument("--poll-attempts", type=int, default=5); a.add_argument("--poll-seconds", type=float, default=2.0)
+    mode = a.add_mutually_exclusive_group(); mode.add_argument("--observe", action="store_true", help="observation-only mode; never submits an order"); mode.add_argument("--execute", action="store_true", help="submit only to explicitly configured Alpaca paper account")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "backtest":
@@ -65,3 +73,51 @@ def main() -> None:
             logger = logging.getLogger(__name__); logger.info("shutdown_requested")
         finally:
             trader.stop()
+    elif args.command == "alpaca-data-check":
+        try:
+            config = AlpacaConfig.from_env()
+        except AlpacaConfigurationError as exc:
+            parser.error(str(exc))
+        provider = AlpacaMarketDataProvider(args.symbol, args.window, config)
+        snapshot = provider.get_completed_bars(args.symbol, datetime.now(timezone.utc))
+        print(json.dumps({"symbol": snapshot.symbol, "bars": len(snapshot.bars), "first_completed_date": snapshot.bars[0].date.isoformat(), "last_completed_date": snapshot.bars[-1].date.isoformat(), "last_close": snapshot.latest_price, "data_timestamp": snapshot.data_timestamp.isoformat(), "feed": config.data_feed}, indent=2))
+    elif args.command == "alpaca-cycle":
+        try:
+            config = AlpacaConfig.from_env()
+        except AlpacaConfigurationError as exc:
+            parser.error(str(exc))
+        if args.execute and not config.execution_enabled:
+            parser.error("--execute requires APCA_EXECUTION_ENABLED=true; observation is the default")
+        execution_config = replace(config, execution_enabled=bool(args.execute and config.execution_enabled))
+        now = datetime.now(timezone.utc)
+        provider = AlpacaMarketDataProvider(args.symbol, args.window, execution_config)
+        broker = AlpacaBroker(execution_config, state_path=Path(args.audit_dir) / "alpaca_orders.json")
+        if args.max_order_shares is not None and args.max_order_shares < 1:
+            parser.error("--max-order-shares must be positive")
+        if args.poll_attempts < 1 or args.poll_seconds < 0:
+            parser.error("poll attempts must be positive and poll seconds cannot be negative")
+        if args.execute:
+            try:
+                broker.preflight(args.symbol)
+            except BrokerError as exc:
+                parser.error(f"Alpaca preflight refused execution: {exc}")
+            print(f"MODE: ALPACA PAPER EXECUTION\nSYMBOL: {args.symbol}\nMAX EXECUTION QUANTITY: {args.max_order_shares or 'strategy-sized'} SHARE(S)\nBROKER: PAPER")
+        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(), audit_store=TradingAuditStore(args.audit_dir), execution_mode="paper_execution" if args.execute else "observation", max_execution_shares=args.max_order_shares)
+        decision = service.run(args.symbol, now)
+        if args.execute and decision.submitted_order is not None:
+            observed_order, observed_fill = broker.poll_order(decision.submitted_order, attempts=args.poll_attempts, interval_seconds=args.poll_seconds)
+            outcome = "EXECUTED" if observed_fill is not None and observed_order.status == "FILLED" else observed_order.status
+            expected_before = next((position.shares for position in decision.portfolio_before.positions if position.symbol == args.symbol), 0) if decision.portfolio_before else None
+            filled_quantity = observed_fill.quantity if observed_fill else 0
+            expected_after = None if expected_before is None else expected_before + (filled_quantity if observed_order.intent.side.value == "BUY" else -filled_quantity)
+            reconciliation = BrokerReconciliation(broker, Path(args.audit_dir) / "reconciliation").reconcile_order(cycle_id=decision.cycle_id, symbol=args.symbol, client_order_id=decision.submitted_order.client_order_id or "", expected_quantity=decision.execution_order.quantity if decision.execution_order else decision.submitted_order.intent.quantity, expected_position=expected_after)
+            decision = replace(decision, submitted_order=observed_order, fill=observed_fill, outcome=outcome, reconciliation=asdict(reconciliation))
+            service.audit_store.save(decision)
+        status_store = StatusStore(Path(args.audit_dir) / "status.json")
+        operational = status_store.load()
+        operational.mode = "paper"
+        operational.execution_enabled = execution_config.execution_enabled
+        operational.broker_connected = True if decision.portfolio_before is not None else None
+        operational.update_from_decision(decision)
+        status_store.save(operational)
+        print(json.dumps({"mode": "paper-execution" if execution_config.execution_enabled else "paper-observation", "cycle_id": decision.cycle_id, "signal": decision.signal, "outcome": decision.outcome, "data_timestamp": decision.data_timestamp, "client_order_id": decision.proposed_order.client_order_id if decision.proposed_order else None, "alpaca_order_id": decision.submitted_order.broker_order_id if decision.submitted_order else None, "order_status": decision.submitted_order.status if decision.submitted_order else None, "filled_quantity": decision.fill.quantity if decision.fill else 0, "actual_fill_price": decision.fill.price if decision.fill else None, "reconciliation": decision.reconciliation}, default=str, indent=2))

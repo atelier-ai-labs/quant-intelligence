@@ -89,7 +89,11 @@ export function TraderDashboardPage() {
     <main className="page trader-page">
       <section className="paper-banner">
         <span className="eyebrow">Execution environment</span>
-        <strong>PAPER TRADING</strong>
+        <strong>
+          {status?.execution_enabled
+            ? "PAPER — EXECUTION MODE"
+            : "PAPER — OBSERVATION MODE"}
+        </strong>
         <span>Read-only operations view · no live orders</span>
       </section>
       {error && <div className="inline-error">Refresh issue: {error}</div>}
@@ -122,6 +126,17 @@ export function TraderDashboardPage() {
           label="Trader"
           value={status?.state?.toUpperCase() ?? "UNKNOWN"}
           tone={status?.state === "running" ? "positive" : "neutral"}
+        />
+        <StatusItem
+          label="Broker"
+          value={
+            status?.broker_connected == null
+              ? "UNKNOWN"
+              : status.broker_connected
+                ? "CONNECTED"
+                : "UNAVAILABLE"
+          }
+          tone={status?.broker_connected ? "positive" : "negative"}
         />
         <StatusItem
           label="Data timestamp"
@@ -378,6 +393,14 @@ function DecisionDetail({
           }
         />
         <FlowStep
+          label="Execution order"
+          value={
+            decision.execution_order
+              ? `${decision.execution_order.side} ${decision.execution_order.quantity} ${decision.execution_order.symbol}`
+              : "None"
+          }
+        />
+        <FlowStep
           label="Risk decision"
           value={`${decision.risk_decision.approved ? "Approved" : "Rejected"} · ${decision.risk_decision.reason}`}
         />
@@ -399,6 +422,13 @@ function DecisionDetail({
         />
       </div>
       {decision.error && <div className="inline-error">{decision.error}</div>}
+      {decision.reconciliation && (
+        <div className="data-note">
+          Reconciliation: <strong>{decision.reconciliation.status}</strong> ·
+          expected filled {decision.reconciliation.expected_quantity}, observed{" "}
+          {decision.reconciliation.observed_filled_quantity}
+        </div>
+      )}
       <div className="snapshot-grid">
         <Snapshot
           label="Portfolio before"

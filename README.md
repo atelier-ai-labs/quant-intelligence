@@ -105,6 +105,43 @@ quant-intelligence paper-run \
 
 The scheduler, clock, autonomous trader, and status persistence live under `quant_intelligence.trading`. They orchestrate `TradingCycleService`; they do not contain strategy or accounting logic.
 
+## Alpaca paper adapters v0.3
+
+Alpaca integration is edge-only: `AlpacaMarketDataProvider` converts completed daily bars into the existing `Bar`/`MarketDataSnapshot` types, while `AlpacaBroker` implements the existing broker boundary. The strategy, risk gate, cycle service, audit model, and dashboard do not depend on Alpaca SDK objects.
+
+Install the optional runtime dependency with `pip install -e ".[dev]"`. Configure credentials only through environment variables or a local ignored `.env` file:
+
+```text
+APCA_API_KEY_ID=
+APCA_API_SECRET_KEY=
+APCA_PAPER=true
+APCA_EXECUTION_ENABLED=false
+APCA_DATA_FEED=iex
+```
+
+`APCA_PAPER` must remain `true`. Execution is disabled by default. The adapter requests daily bars ending at the start of the current UTC date and filters out any bar dated today, so an incomplete current candle cannot reach the SMA strategy. The default `iex` feed is the free feed available to the configured account; it is not a claim that IEX-only data represents the full consolidated market.
+
+Safe connectivity/data smoke test:
+
+```bash
+quant-intelligence alpaca-data-check --symbol SPY --window 200
+```
+
+Observation mode is the default and never submits an order:
+
+```bash
+quant-intelligence alpaca-cycle --symbol SPY --window 200 --observe
+```
+
+Paper execution requires both an explicit command flag and server-side configuration:
+
+```bash
+APCA_EXECUTION_ENABLED=true \
+quant-intelligence alpaca-cycle --symbol SPY --window 200 --execute
+```
+
+An Alpaca submission uses a stable client order ID derived from the Quant cycle ID. Known failures become no-trade decisions; timeouts/connection failures become `UNKNOWN` and are reconciled by client order ID without blind retry. Decisions expire while positions persist: a stale intent is never replayed after recovery. `BrokerReconciliation` records expected versus observed order/position state before any synchronization.
+
 ## Assumptions and methodology
 
 Signals for day `t` use only bars before day `t`; a 200-day SMA is calculated from closes through `t-1`, and changes execute at day `t` open. Buys use the maximum whole-share quantity affordable after the configured cost; fractional shares are disabled. Costs equal traded notional × bps / 10,000. The benchmark buys whole shares at the first selected bar's open, applies the same cost model, holds through the final close, and leaves residual cash idle.

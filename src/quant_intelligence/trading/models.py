@@ -24,6 +24,8 @@ class OrderIntent:
     order_type: str = "MARKET"
     asset_type: str = "EQUITY"
     reason: str = ""
+    client_order_id: str | None = None
+    cycle_id: str | None = None
 
 @dataclass(frozen=True)
 class Order:
@@ -31,6 +33,11 @@ class Order:
     intent: OrderIntent
     submitted_at: datetime
     status: str
+    client_order_id: str | None = None
+    broker_order_id: str | None = None
+    filled_quantity: int = 0
+    average_fill_price: float | None = None
+    filled_at: datetime | None = None
 
 @dataclass(frozen=True)
 class Fill:
@@ -82,3 +89,5 @@ class TradingDecision:
     portfolio_after: PortfolioSnapshot | None
     outcome: str
     error: str | None = None
+    execution_order: OrderIntent | None = None
+    reconciliation: dict[str, Any] | None = None

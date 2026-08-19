@@ -11,10 +11,19 @@ from .models import Fill, Order, OrderIntent, PortfolioSnapshot, Position, Signa
 class BrokerError(RuntimeError):
     pass
 
+class BrokerUnavailable(BrokerError):
+    """The broker was known to be unavailable before an order was submitted."""
+
+class BrokerSubmissionUnknown(BrokerError):
+    """The request may have reached the broker; never retry blindly."""
+
+class ExecutionDisabled(BrokerError):
+    """Observation mode intentionally refuses order submission."""
+
 class Broker(Protocol):
     def get_account(self) -> tuple[float, float]: ...
     def get_positions(self) -> tuple[Position, ...]: ...
-    def submit_order(self, intent: OrderIntent, price: float, timestamp: datetime) -> tuple[Order, Fill]: ...
+    def submit_order(self, intent: OrderIntent, price: float, timestamp: datetime) -> tuple[Order, Fill | None]: ...
     def get_order(self, order_id: str) -> Order | None: ...
     def get_portfolio_snapshot(self, prices: dict[str, float], timestamp: datetime) -> PortfolioSnapshot: ...
 
@@ -59,7 +68,7 @@ class PaperBroker:
             if remaining: self.positions[intent.symbol] = Position(intent.symbol, remaining, current.average_price)
             else: self.positions.pop(intent.symbol, None)
         else: raise BrokerError("broker accepts BUY or SELL orders only")
-        order = Order(uuid4().hex, intent, timestamp, "FILLED")
+        order = Order(uuid4().hex, intent, timestamp, "FILLED", intent.client_order_id, None, intent.quantity, price, timestamp)
         fill = Fill(order.order_id, intent.symbol, intent.side, intent.quantity, price, gross, cost, timestamp)
         self.orders[order.order_id] = order; self.fills.append(fill); self.transaction_costs_paid += cost
         self._save_state()
@@ -72,7 +81,7 @@ class PaperBroker:
     def _save_state(self) -> None:
         if self.state_path is None: return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"cash": self.cash, "transaction_costs_paid": self.transaction_costs_paid, "positions": [asdict(position) for position in self.positions.values()], "orders": [{"order_id": order.order_id, "intent": {**asdict(order.intent), "side": order.intent.side.value}, "submitted_at": order.submitted_at.isoformat(), "status": order.status} for order in self.orders.values()], "fills": [{**asdict(fill), "side": fill.side.value, "filled_at": fill.filled_at.isoformat()} for fill in self.fills]}
+        payload = {"cash": self.cash, "transaction_costs_paid": self.transaction_costs_paid, "positions": [asdict(position) for position in self.positions.values()], "orders": [{"order_id": order.order_id, "intent": {**asdict(order.intent), "side": order.intent.side.value}, "submitted_at": order.submitted_at.isoformat(), "status": order.status, "client_order_id": order.client_order_id, "broker_order_id": order.broker_order_id, "filled_quantity": order.filled_quantity, "average_fill_price": order.average_fill_price, "filled_at": order.filled_at.isoformat() if order.filled_at else None} for order in self.orders.values()], "fills": [{**asdict(fill), "side": fill.side.value, "filled_at": fill.filled_at.isoformat()} for fill in self.fills]}
         self.state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _load_state(self) -> None:
@@ -80,5 +89,5 @@ class PaperBroker:
         payload = json.loads(self.state_path.read_text(encoding="utf-8"))
         self.cash = payload["cash"]; self.transaction_costs_paid = payload["transaction_costs_paid"]
         self.positions = {item["symbol"]: Position(item["symbol"], item["shares"], item["average_price"]) for item in payload["positions"]}
-        self.orders = {item["order_id"]: Order(item["order_id"], OrderIntent(item["intent"]["symbol"], SignalAction(item["intent"]["side"]), item["intent"]["quantity"], item["intent"]["order_type"], item["intent"]["asset_type"], item["intent"]["reason"]), datetime.fromisoformat(item["submitted_at"]), item["status"]) for item in payload["orders"]}
+        self.orders = {item["order_id"]: Order(item["order_id"], OrderIntent(item["intent"]["symbol"], SignalAction(item["intent"]["side"]), item["intent"]["quantity"], item["intent"]["order_type"], item["intent"]["asset_type"], item["intent"]["reason"], item["intent"].get("client_order_id"), item["intent"].get("cycle_id")), datetime.fromisoformat(item["submitted_at"]), item["status"], item.get("client_order_id"), item.get("broker_order_id"), item.get("filled_quantity", 0), item.get("average_fill_price"), datetime.fromisoformat(item["filled_at"]) if item.get("filled_at") else None) for item in payload["orders"]}
         self.fills = [Fill(item["order_id"], item["symbol"], SignalAction(item["side"]), item["quantity"], item["price"], item["gross_notional"], item["transaction_cost"], datetime.fromisoformat(item["filled_at"])) for item in payload["fills"]]

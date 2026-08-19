@@ -156,7 +156,7 @@ body {
 }
 .spec-strip {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   border-top: 1px solid #292e35;
   border-bottom: 1px solid #292e35;
   background: #121519;
@@ -775,10 +775,10 @@ tr:hover td {
   .status-strip {
     grid-template-columns: repeat(2, 1fr);
   }
-  .status-strip > div:nth-child(2) {
+  .status-strip > div:nth-child(even) {
     border-right: 0;
   }
-  .status-strip > div:nth-child(-n + 2) {
+  .status-strip > div:nth-child(-n + 4) {
     border-bottom: 1px solid #292e35;
   }
   .portfolio-metrics {

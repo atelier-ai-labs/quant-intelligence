@@ -118,7 +118,7 @@ describe("trader dashboard", () => {
     render(<TraderDashboardPage />);
     expect(screen.getByText("Loading operations")).toBeInTheDocument();
     await waitFor(() =>
-      expect(screen.getByText("PAPER TRADING")).toBeInTheDocument(),
+      expect(screen.getByText("PAPER — OBSERVATION MODE")).toBeInTheDocument(),
     );
     expect(screen.getAllByText("RUNNING").length).toBeGreaterThan(0);
     expect(screen.getAllByText("SYNTH").length).toBeGreaterThan(0);
@@ -142,5 +142,29 @@ describe("trader dashboard", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.getByText("API offline")).toBeInTheDocument();
+  });
+
+  it("labels explicitly enabled paper execution separately from observation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/status"))
+          return response({
+            available: true,
+            mode: "paper",
+            state: "running",
+            execution_enabled: true,
+            broker_connected: true,
+          });
+        if (url.endsWith("/portfolio"))
+          return response({ available: true, mode: "paper", positions: [] });
+        return response([]);
+      }),
+    );
+    render(<TraderDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByText("PAPER — EXECUTION MODE")).toBeInTheDocument(),
+    );
+    expect(screen.getByText("CONNECTED")).toBeInTheDocument();
   });
 });

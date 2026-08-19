@@ -2,6 +2,9 @@ export type TraderStatus = {
   available: boolean;
   mode: "paper";
   state?: "running" | "stopped" | string;
+  execution_enabled?: boolean;
+  broker_connected?: boolean | null;
+  last_reconciliation_status?: string | null;
   last_cycle_id?: string | null;
   last_cycle_timestamp?: string | null;
   last_cycle_outcome?: string | null;
@@ -53,9 +56,19 @@ export type TradingDecision = DecisionSummary & {
   signal_reason: string;
   portfolio_before: PortfolioSnapshot | null;
   proposed_order: OrderIntent | null;
+  execution_order: OrderIntent | null;
   risk_decision: RiskDecision;
   submitted_order: SubmittedOrder | null;
   portfolio_after: PortfolioSnapshot | null;
+  reconciliation?: {
+    status: string;
+    expected_quantity: number;
+    observed_filled_quantity: number;
+    expected_position: number | null;
+    observed_position: number | null;
+    broker_order_id: string | null;
+    error: string | null;
+  } | null;
 };
 
 export type OrderIntent = {

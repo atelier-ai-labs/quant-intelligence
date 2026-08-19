@@ -13,7 +13,7 @@ def _json_default(value: Any):
     raise TypeError(f"cannot serialize {type(value)!r}")
 
 def _intent(data: dict[str, Any] | None) -> OrderIntent | None:
-    return None if data is None else OrderIntent(data["symbol"], SignalAction(data["side"]), data["quantity"], data["order_type"], data["asset_type"], data["reason"])
+    return None if data is None else OrderIntent(data["symbol"], SignalAction(data["side"]), data["quantity"], data["order_type"], data["asset_type"], data["reason"], data.get("client_order_id"), data.get("cycle_id"))
 
 def _snapshot(data: dict[str, Any] | None) -> PortfolioSnapshot | None:
     if data is None: return None
@@ -21,11 +21,11 @@ def _snapshot(data: dict[str, Any] | None) -> PortfolioSnapshot | None:
 
 def decision_from_dict(data: dict[str, Any]) -> TradingDecision:
     submitted = data.get("submitted_order")
-    order = None if submitted is None else Order(submitted["order_id"], _intent(submitted["intent"]), datetime.fromisoformat(submitted["submitted_at"]), submitted["status"])
+    order = None if submitted is None else Order(submitted["order_id"], _intent(submitted["intent"]), datetime.fromisoformat(submitted["submitted_at"]), submitted["status"], submitted.get("client_order_id"), submitted.get("broker_order_id"), submitted.get("filled_quantity", 0), submitted.get("average_fill_price"), datetime.fromisoformat(submitted["filled_at"]) if submitted.get("filled_at") else None)
     fill_data = data.get("fill")
     fill = None if fill_data is None else Fill(fill_data["order_id"], fill_data["symbol"], SignalAction(fill_data["side"]), fill_data["quantity"], fill_data["price"], fill_data["gross_notional"], fill_data["transaction_cost"], datetime.fromisoformat(fill_data["filled_at"]))
     risk = data["risk_decision"]
-    return TradingDecision(data["cycle_id"], datetime.fromisoformat(data["timestamp"]), data["symbol"], data["strategy"], data["strategy_parameters"], datetime.fromisoformat(data["data_timestamp"]) if data.get("data_timestamp") else None, SignalAction(data["signal"]), data["signal_reason"], _snapshot(data.get("portfolio_before")), _intent(data.get("proposed_order")), RiskDecision(risk["approved"], risk["reason"], _intent(risk.get("intent"))), order, fill, _snapshot(data.get("portfolio_after")), data["outcome"], data.get("error"))
+    return TradingDecision(data["cycle_id"], datetime.fromisoformat(data["timestamp"]), data["symbol"], data["strategy"], data["strategy_parameters"], datetime.fromisoformat(data["data_timestamp"]) if data.get("data_timestamp") else None, SignalAction(data["signal"]), data["signal_reason"], _snapshot(data.get("portfolio_before")), _intent(data.get("proposed_order")), RiskDecision(risk["approved"], risk["reason"], _intent(risk.get("intent"))), order, fill, _snapshot(data.get("portfolio_after")), data["outcome"], data.get("error"), _intent(data.get("execution_order")), data.get("reconciliation"))
 
 class TradingAuditStore:
     def __init__(self, root: str | Path):
