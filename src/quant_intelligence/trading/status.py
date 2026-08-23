@@ -20,10 +20,20 @@ class OperationalStatus:
     broker_connected: bool | None = None
     last_reconciliation_status: str | None = None
     unresolved_symbols: tuple[str, ...] = field(default_factory=tuple)
+    broker_health: str = "unknown"
+    market_data_health: str = "unknown"
+    latest_completed_session: str | None = None
+    next_scheduled_decision: datetime | None = None
+    last_reconciliation_timestamp: datetime | None = None
+    unresolved_order_count: int = 0
+    trading_health: str = "unknown"
+    halt_reason: str | None = None
+    managed_symbols: tuple[str, ...] = field(default_factory=tuple)
 
     def update_from_decision(self, decision: TradingDecision) -> None:
         self.last_cycle_id = decision.cycle_id; self.last_cycle_timestamp = decision.timestamp; self.last_cycle_outcome = decision.outcome; self.last_error = decision.error
         self.most_recent_market_data_timestamp = decision.data_timestamp
+        self.market_data_health = "healthy" if decision.data_timestamp else "unavailable"
         snapshot = decision.portfolio_after or decision.portfolio_before
         if snapshot:
             self.current_equity = snapshot.equity; self.current_cash = snapshot.cash; self.current_positions = snapshot.positions
@@ -35,10 +45,10 @@ class StatusStore:
     def load(self) -> OperationalStatus:
         if not self.path.is_file(): return OperationalStatus()
         data = json.loads(self.path.read_text(encoding="utf-8")); positions = tuple(Position(item["symbol"], item["shares"], item["average_price"]) for item in data.get("current_positions", []))
-        return OperationalStatus(data.get("state", "stopped"), data.get("last_cycle_id"), datetime.fromisoformat(data["last_cycle_timestamp"]) if data.get("last_cycle_timestamp") else None, data.get("last_cycle_outcome"), data.get("last_error"), data.get("current_equity"), data.get("current_cash"), positions, datetime.fromisoformat(data["most_recent_market_data_timestamp"]) if data.get("most_recent_market_data_timestamp") else None, data.get("mode", "paper"), data.get("execution_enabled", False), data.get("broker_connected"), data.get("last_reconciliation_status"), tuple(data.get("unresolved_symbols", [])))
+        return OperationalStatus(data.get("state", "stopped"), data.get("last_cycle_id"), datetime.fromisoformat(data["last_cycle_timestamp"]) if data.get("last_cycle_timestamp") else None, data.get("last_cycle_outcome"), data.get("last_error"), data.get("current_equity"), data.get("current_cash"), positions, datetime.fromisoformat(data["most_recent_market_data_timestamp"]) if data.get("most_recent_market_data_timestamp") else None, data.get("mode", "paper"), data.get("execution_enabled", False), data.get("broker_connected"), data.get("last_reconciliation_status"), tuple(data.get("unresolved_symbols", [])), data.get("broker_health", "unknown"), data.get("market_data_health", "unknown"), data.get("latest_completed_session"), datetime.fromisoformat(data["next_scheduled_decision"]) if data.get("next_scheduled_decision") else None, datetime.fromisoformat(data["last_reconciliation_timestamp"]) if data.get("last_reconciliation_timestamp") else None, data.get("unresolved_order_count", 0), data.get("trading_health", "unknown"), data.get("halt_reason"), tuple(data.get("managed_symbols", [])))
 
     def save(self, status: OperationalStatus) -> None:
         data = asdict(status)
-        for key in ("last_cycle_timestamp", "most_recent_market_data_timestamp"):
+        for key in ("last_cycle_timestamp", "most_recent_market_data_timestamp", "next_scheduled_decision", "last_reconciliation_timestamp"):
             if data[key] is not None: data[key] = data[key].isoformat()
         self.path.write_text(json.dumps(data, default=str, indent=2), encoding="utf-8")

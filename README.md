@@ -142,6 +142,38 @@ quant-intelligence alpaca-cycle --symbol SPY --window 200 --execute
 
 An Alpaca submission uses a stable client order ID derived from the Quant cycle ID. Known failures become no-trade decisions; timeouts/connection failures become `UNKNOWN` and are reconciled by client order ID without blind retry. Decisions expire while positions persist: a stale intent is never replayed after recovery. `BrokerReconciliation` records expected versus observed order/position state before any synchronization.
 
+## Alpaca autonomous forward paper trader v0.4
+
+`alpaca-run` evolves the existing `AutonomousTrader`; it does not introduce a second execution framework. It uses Alpaca's supported market calendar, waits until a completed daily session plus a five-minute safety delay, reconciles broker state before evaluating SMA, and persists the completed session, next decision, reconciliation state, and halt reason. A session identity is processed at most once, so restarting the process cannot replay the same daily order. The default forward-paper limits are 25% maximum position allocation, $2,500 maximum order notional, and 10 shares per order; all are configurable flags and execution remains disabled unless explicitly enabled.
+
+Use the no-order validation mode first:
+
+```bash
+quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
+```
+
+After reviewing its reconciliation and scheduling output, an operator can explicitly enable the bounded-risk paper service:
+
+```bash
+quant-intelligence alpaca-run --symbol SPY --window 200
+```
+
+The service sleeps until the next Alpaca calendar decision time, handles Ctrl+C cleanly, and performs reconciliation-only wakeups while an order is unresolved. `TRADING HEALTH` is persisted separately from `PROCESS RUNNING`; broker, data, calendar, and reconciliation uncertainty halt trading fail-closed. v0.4 assumes a dedicated paper account or an explicitly managed symbol set. Existing positions without a persisted Quant fill are treated as unmanaged and are never liquidated by the strategy.
+
+## PostgreSQL operational persistence
+
+Autonomous operational state can be cut over independently of research JSON. Set `QI_TRADING_PERSISTENCE=postgres` and a standard PostgreSQL `DATABASE_URL`; credentials are never logged or sent to the frontend. The default `json` mode remains available during the transition and does not rewrite or delete existing JSON records.
+
+```bash
+export QI_TRADING_PERSISTENCE=postgres
+export DATABASE_URL='postgresql+psycopg://user:password@localhost:5432/quant_intelligence'
+alembic upgrade head
+uvicorn quant_intelligence.api.main:app --reload
+quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
+```
+
+To roll back the latest schema revision, use `alembic downgrade -1`. The same `DATABASE_URL` format works with hosted PostgreSQL services such as Neon; no provider-specific API is required. The initial migration creates `trading_cycles`, `orders`, `fills`, `reconciliations`, `managed_positions`, and `operational_status`. Research/backtest result JSON remains file-based.
+
 ## Assumptions and methodology
 
 Signals for day `t` use only bars before day `t`; a 200-day SMA is calculated from closes through `t-1`, and changes execute at day `t` open. Buys use the maximum whole-share quantity affordable after the configured cost; fractional shares are disabled. Costs equal traded notional × bps / 10,000. The benchmark buys whole shares at the first selected bar's open, applies the same cost model, holds through the final close, and leaves residual cash idle.

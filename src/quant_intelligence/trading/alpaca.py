@@ -352,6 +352,10 @@ class AlpacaBroker:
         self.unresolved_symbols.discard(symbol)
         self._save_metadata()
 
+    def is_position_managed(self, symbol: str) -> bool:
+        """Only positions with persisted Quant fills are strategy-managed."""
+        return any(item.get("symbol") == symbol and item.get("status") in {"FILLED", "PARTIALLY_FILLED"} for item in self.order_metadata.values())
+
     def _save_metadata(self) -> None:
         if self.state_path is None:
             return

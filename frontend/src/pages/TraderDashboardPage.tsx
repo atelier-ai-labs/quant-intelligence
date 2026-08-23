@@ -148,6 +148,39 @@ export function TraderDashboardPage() {
           tone={status?.last_error ? "negative" : "positive"}
         />
         <StatusItem label="Open positions" value={String(positionCount)} />
+        <StatusItem
+          label="Trading health"
+          value={status?.trading_health?.toUpperCase() ?? "UNKNOWN"}
+          tone={status?.trading_health === "healthy" ? "positive" : "negative"}
+        />
+        <StatusItem
+          label="Last session"
+          value={status?.latest_completed_session ?? "—"}
+        />
+        <StatusItem
+          label="Unresolved orders"
+          value={String(status?.unresolved_order_count ?? 0)}
+          tone={status?.unresolved_order_count ? "negative" : "positive"}
+        />
+      </section>
+      {status?.trading_health === "halted" && (
+        <div className="inline-error">
+          TRADING HALTED: {status.halt_reason ?? "No reason recorded"}
+        </div>
+      )}
+      <section className="status-strip">
+        <StatusItem
+          label="Next decision"
+          value={timeLabel(status?.next_scheduled_decision)}
+        />
+        <StatusItem
+          label="Last reconciliation"
+          value={timeLabel(status?.last_reconciliation_timestamp)}
+        />
+        <StatusItem
+          label="Managed symbols"
+          value={status?.managed_symbols?.join(", ") ?? "—"}
+        />
       </section>
       <section className="ops-grid">
         <div className="panel ops-panel">

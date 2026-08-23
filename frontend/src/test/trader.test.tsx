@@ -167,4 +167,29 @@ describe("trader dashboard", () => {
     );
     expect(screen.getByText("CONNECTED")).toBeInTheDocument();
   });
+
+  it("makes a halted trading state and reason visible", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/status"))
+          return response({
+            available: true,
+            mode: "paper",
+            state: "running",
+            trading_health: "halted",
+            halt_reason: "Unresolved broker order",
+            unresolved_order_count: 1,
+          });
+        if (url.endsWith("/portfolio"))
+          return response({ available: true, mode: "paper", positions: [] });
+        return response([]);
+      }),
+    );
+    render(<TraderDashboardPage />);
+    await waitFor(() =>
+      expect(screen.getByText(/TRADING HALTED/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/Unresolved broker order/)).toBeInTheDocument();
+  });
 });

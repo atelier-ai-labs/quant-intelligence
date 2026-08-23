@@ -14,6 +14,15 @@ export type TraderStatus = {
   current_positions?: Position[];
   most_recent_market_data_timestamp?: string | null;
   reason?: string;
+  broker_health?: string;
+  market_data_health?: string;
+  latest_completed_session?: string | null;
+  next_scheduled_decision?: string | null;
+  last_reconciliation_timestamp?: string | null;
+  unresolved_order_count?: number;
+  trading_health?: string;
+  halt_reason?: string | null;
+  managed_symbols?: string[];
 };
 
 export type Position = {

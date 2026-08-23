@@ -57,7 +57,11 @@ class TradingCycleService:
             signal = SignalAction.BUY; reason = "SMA desired position is LONG"
             intent = OrderIntent(symbol, signal, quantity, reason=reason)
         elif desired == "CASH" and owned > 0:
-            signal = SignalAction.SELL; reason = "SMA desired position is CASH"; intent = OrderIntent(symbol, signal, owned, reason=reason)
+            managed = getattr(self.broker, "is_position_managed", lambda _symbol: True)(symbol)
+            if not managed:
+                signal = SignalAction.HOLD; reason = "unmanaged broker position preserved"; intent = None
+            else:
+                signal = SignalAction.SELL; reason = "SMA desired position is CASH"; intent = OrderIntent(symbol, signal, owned, reason=reason)
         else:
             signal = SignalAction.HOLD; reason = "desired position matches current portfolio"; intent = None
         if intent is None:
@@ -69,6 +73,10 @@ class TradingCycleService:
         risk = self.risk_gate.evaluate(execution_intent, before, market.latest_price)
         if not risk.approved:
             return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, risk, None, None, before, "NO_TRADE", None, execution_intent))
+        # Durable intent is written before an external submission. If this
+        # transaction fails, no broker request is permitted to proceed.
+        if self.execution_mode != "observation":
+            self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, risk, None, None, before, "PENDING_SUBMISSION", None, execution_intent))
         try:
             order, fill = self.broker.submit_order(execution_intent, market.latest_price, timestamp)
         except ExecutionDisabled as exc:

@@ -6,10 +6,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
-from quant_intelligence.trading.audit import TradingAuditStore
-from quant_intelligence.trading.broker import PaperBroker
 from quant_intelligence.trading.models import TradingDecision
-from quant_intelligence.trading.status import OperationalStatus, StatusStore
+from quant_intelligence.trading.persistence import OperationalRepository
+from quant_intelligence.trading.status import OperationalStatus
 
 router = APIRouter(prefix="/api/trader", tags=["trader"])
 
@@ -28,22 +27,17 @@ def _json_value(value: Any) -> Any:
     return value
 
 
-def _status_store(request: Request) -> StatusStore:
-    return request.app.state.trader_status_store
-
-
-def _audit_store(request: Request) -> TradingAuditStore:
-    return request.app.state.trader_audit_store
-
-
-def _broker(request: Request) -> PaperBroker:
-    return PaperBroker(0, state_path=request.app.state.trader_broker_state_path)
+def _repository(request: Request) -> OperationalRepository:
+    return request.app.state.trader_operational_repository
 
 
 def _load_status(request: Request) -> OperationalStatus | None:
     try:
-        path = _status_store(request).path
-        return _status_store(request).load() if path.is_file() else None
+        repository = _repository(request)
+        status_store = getattr(repository, "status", None)
+        if status_store is not None and not status_store.path.is_file():
+            return None
+        return repository.load_status()
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"trader status unavailable: {exc}") from exc
 
@@ -88,9 +82,9 @@ def get_trader_portfolio(request: Request) -> dict[str, Any]:
     if current is None:
         return {"available": False, "mode": "paper", "reason": "no operational status has been persisted", "positions": []}
     try:
-        broker = _broker(request)
-        cash, transaction_costs_paid = broker.get_account()
-        positions = broker.get_positions()
+        positions = current.current_positions
+        cash = current.current_cash
+        transaction_costs_paid = None
     except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError) as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"paper portfolio unavailable: {exc}") from exc
     return _json_value({
@@ -110,23 +104,17 @@ def get_trader_portfolio(request: Request) -> dict[str, Any]:
 
 @router.get("/decisions")
 def list_trader_decisions(request: Request, limit: int = Query(default=25, ge=1, le=100)) -> list[dict[str, Any]]:
-    store = _audit_store(request)
-    decisions: list[TradingDecision] = []
-    for path in store.root.glob("*.json"):
-        try:
-            decision = store.get(path.stem)
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            continue
-        if decision is not None:
-            decisions.append(decision)
-    decisions.sort(key=lambda item: item.timestamp, reverse=True)
+    try:
+        decisions = _repository(request).list()
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"decision records unavailable: {exc}") from exc
     return [_decision_summary(decision) for decision in decisions[:limit]]
 
 
 @router.get("/decisions/{cycle_id}")
 def get_trader_decision(cycle_id: str, request: Request) -> dict[str, Any]:
     try:
-        decision = _audit_store(request).get(cycle_id)
+        decision = _repository(request).get(cycle_id)
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"decision record unavailable: {exc}") from exc
     if decision is None:
