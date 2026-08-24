@@ -12,15 +12,15 @@ from .broker import Broker, BrokerError, ExecutionDisabled, BrokerSubmissionUnkn
 from .clock import Clock, SystemClock
 from .market import MarketDataProvider, MarketDataUnavailable
 from .models import OrderIntent, PortfolioSnapshot, RiskDecision, SignalAction, TradingDecision
-from .risk import RiskGate
+from .risk import RiskConfig, RiskGate, RiskMode
 
 logger = logging.getLogger(__name__)
 
 class TradingCycleService:
-    def __init__(self, *, strategy: SmaTrendStrategy, broker: Broker, market_data: MarketDataProvider, risk_gate: RiskGate, audit_store: TradingAuditStore, strategy_name: str = "sma_trend", strategy_version: str = "1", clock: Clock | None = None, execution_mode: str = "paper", max_execution_shares: int | None = None):
+    def __init__(self, *, strategy: SmaTrendStrategy, broker: Broker, market_data: MarketDataProvider, risk_gate: RiskGate, audit_store: TradingAuditStore, strategy_name: str = "sma_trend", strategy_version: str = "1", clock: Clock | None = None, execution_mode: str = "paper", max_execution_shares: int | None = None, risk_state_store: Any | None = None, risk_config: RiskConfig | None = None, risk_account_key: str = "default"):
         if max_execution_shares is not None and max_execution_shares < 1:
             raise ValueError("max_execution_shares must be positive")
-        self.strategy = strategy; self.broker = broker; self.market_data = market_data; self.risk_gate = risk_gate; self.audit_store = audit_store; self.strategy_name = strategy_name; self.strategy_version = strategy_version; self.clock = clock or SystemClock(); self.execution_mode = execution_mode; self.max_execution_shares = max_execution_shares
+        self.strategy = strategy; self.broker = broker; self.market_data = market_data; self.risk_gate = risk_gate; self.audit_store = audit_store; self.strategy_name = strategy_name; self.strategy_version = strategy_version; self.clock = clock or SystemClock(); self.execution_mode = execution_mode; self.max_execution_shares = max_execution_shares; self.risk_state_store = risk_state_store; self.risk_config = risk_config or risk_gate.config; self.risk_account_key = risk_account_key
 
     def _cycle_id(self, symbol: str, data_timestamp: datetime) -> str:
         raw = json.dumps({"strategy": self.strategy_name, "version": self.strategy_version, "symbol": symbol, "data_timestamp": data_timestamp.isoformat(), "window": self.strategy.window, "execution_mode": self.execution_mode}, sort_keys=True)
@@ -33,7 +33,7 @@ class TradingCycleService:
     def _snapshot(self, symbol: str, price: float, timestamp: datetime) -> PortfolioSnapshot:
         return self.broker.get_portfolio_snapshot({symbol: price}, timestamp)
 
-    def run(self, symbol: str, now: datetime | None = None) -> TradingDecision:
+    def run(self, symbol: str, now: datetime | None = None, *, reconciled: bool = False, session_id: str | None = None) -> TradingDecision:
         timestamp = now or self.clock.now()
         try:
             market = self.market_data.get_completed_bars(symbol, timestamp)
@@ -48,8 +48,24 @@ class TradingCycleService:
             before = self._snapshot(symbol, market.latest_price, timestamp)
         except Exception as exc:
             return self._save_no_trade(symbol, timestamp, "HOLD", f"broker state unavailable: {exc}", str(exc))
+        observed_session = market.data_timestamp.date().isoformat()
+        if self.risk_state_store is not None:
+            try:
+                current_state = self.risk_state_store.load_risk_state(self.risk_account_key)
+                if current_state is not None:
+                    self.risk_gate.risk_mode = RiskMode(current_state.mode)
+            except Exception as exc:
+                return self._save_no_trade(symbol, timestamp, "HOLD", f"risk state unavailable: {exc}", str(exc))
+        if session_id is not None and observed_session != session_id:
+            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, SignalAction.HOLD, "market data session does not match completed session", before, None, RiskDecision(False, "invalid completed market session", None, self.risk_gate.risk_mode.value), None, None, before, "NO_TRADE", "invalid completed market session"))
         if not self.market_data.is_fresh(market, timestamp):
-            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, SignalAction.HOLD, "market data is stale", before, None, RiskDecision(False, "stale market data", None), None, None, before, "NO_TRADE"))
+            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, SignalAction.HOLD, "market data is stale", before, None, RiskDecision(False, "stale market data", None, self.risk_gate.risk_mode.value), None, None, before, "NO_TRADE", "stale market data"))
+        if self.risk_state_store is not None:
+            try:
+                evaluation = self.risk_state_store.evaluate_risk_state(equity=before.equity, session_id=observed_session, timestamp=timestamp, reconciled=reconciled, valid_session=True, account_key=self.risk_account_key, config=self.risk_config)
+                self.risk_gate.risk_mode = RiskMode(evaluation.state.mode)
+            except Exception as exc:
+                return self._save_no_trade(symbol, timestamp, "HOLD", f"risk state unavailable: {exc}", str(exc))
         desired = self.strategy.desired_position(market.bars)
         owned = next((position.shares for position in before.positions if position.symbol == symbol), 0)
         if desired == "LONG" and owned == 0:
@@ -65,7 +81,7 @@ class TradingCycleService:
         else:
             signal = SignalAction.HOLD; reason = "desired position matches current portfolio"; intent = None
         if intent is None:
-            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, None, RiskDecision(True, "no order required", None), None, None, before, "HOLD"))
+            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, None, RiskDecision(True, "no order required", None, self.risk_gate.risk_mode.value), None, None, before, "HOLD"))
         proposed_order = replace(intent, client_order_id=self._client_order_id(cycle_id), cycle_id=cycle_id)
         execution_intent = proposed_order
         if self.max_execution_shares is not None:
@@ -84,7 +100,7 @@ class TradingCycleService:
         except BrokerSubmissionUnknown as exc:
             return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, risk, None, None, before, "UNKNOWN", str(exc), execution_intent))
         except (BrokerUnavailable, BrokerError) as exc:
-            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, RiskDecision(False, str(exc), execution_intent), None, None, before, "NO_TRADE", str(exc), execution_intent))
+            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, RiskDecision(False, str(exc), execution_intent, self.risk_gate.risk_mode.value), None, None, before, "NO_TRADE", str(exc), execution_intent))
         after = self._snapshot(symbol, market.latest_price, timestamp)
         outcome = "EXECUTED" if fill is not None else order.status
         return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, risk, order, fill, after, outcome, None, execution_intent))
@@ -95,5 +111,5 @@ class TradingCycleService:
 
     def _save_no_trade(self, symbol: str, timestamp: datetime, signal: str, reason: str, error: str) -> TradingDecision:
         cycle_id = hashlib.sha256(f"{self.strategy_name}:{self.execution_mode}:{symbol}:unavailable:{timestamp.isoformat()}".encode()).hexdigest()
-        decision = TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, None, SignalAction(signal), reason, None, None, RiskDecision(False, reason, None), None, None, None, "NO_TRADE", error)
+        decision = TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, None, SignalAction(signal), reason, None, None, RiskDecision(False, reason, None, self.risk_gate.risk_mode.value), None, None, None, "NO_TRADE", error)
         return self._save_decision(decision)

@@ -17,7 +17,7 @@ def _intent(data: dict[str, Any] | None) -> OrderIntent | None:
 
 def _snapshot(data: dict[str, Any] | None) -> PortfolioSnapshot | None:
     if data is None: return None
-    return PortfolioSnapshot(datetime.fromisoformat(data["timestamp"]), data["cash"], tuple(Position(item["symbol"], item["shares"], item["average_price"]) for item in data["positions"]), data["asset_value"], data["equity"], data["transaction_costs_paid"])
+    return PortfolioSnapshot(datetime.fromisoformat(data["timestamp"]), data["cash"], tuple(Position(item["symbol"], item["shares"], item["average_price"]) for item in data["positions"]), data["asset_value"], data["equity"], data["transaction_costs_paid"], data.get("realized_pnl", 0.0), data.get("unrealized_pnl", 0.0), data.get("valuation_complete", True), data.get("positions_complete", True))
 
 def decision_from_dict(data: dict[str, Any]) -> TradingDecision:
     submitted = data.get("submitted_order")
@@ -25,7 +25,7 @@ def decision_from_dict(data: dict[str, Any]) -> TradingDecision:
     fill_data = data.get("fill")
     fill = None if fill_data is None else Fill(fill_data["order_id"], fill_data["symbol"], SignalAction(fill_data["side"]), fill_data["quantity"], fill_data["price"], fill_data["gross_notional"], fill_data["transaction_cost"], datetime.fromisoformat(fill_data["filled_at"]))
     risk = data["risk_decision"]
-    return TradingDecision(data["cycle_id"], datetime.fromisoformat(data["timestamp"]), data["symbol"], data["strategy"], data["strategy_parameters"], datetime.fromisoformat(data["data_timestamp"]) if data.get("data_timestamp") else None, SignalAction(data["signal"]), data["signal_reason"], _snapshot(data.get("portfolio_before")), _intent(data.get("proposed_order")), RiskDecision(risk["approved"], risk["reason"], _intent(risk.get("intent"))), order, fill, _snapshot(data.get("portfolio_after")), data["outcome"], data.get("error"), _intent(data.get("execution_order")), data.get("reconciliation"))
+    return TradingDecision(data["cycle_id"], datetime.fromisoformat(data["timestamp"]), data["symbol"], data["strategy"], data["strategy_parameters"], datetime.fromisoformat(data["data_timestamp"]) if data.get("data_timestamp") else None, SignalAction(data["signal"]), data["signal_reason"], _snapshot(data.get("portfolio_before")), _intent(data.get("proposed_order")), RiskDecision(risk["approved"], risk["reason"], _intent(risk.get("intent")), risk.get("mode", "NORMAL"), risk.get("event_type")), order, fill, _snapshot(data.get("portfolio_after")), data["outcome"], data.get("error"), _intent(data.get("execution_order")), data.get("reconciliation"))
 
 class TradingAuditStore:
     def __init__(self, root: str | Path):

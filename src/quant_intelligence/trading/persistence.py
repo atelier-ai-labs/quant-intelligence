@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+from decimal import Decimal
 from dataclasses import asdict
 from datetime import datetime
 from enum import StrEnum
@@ -46,6 +47,7 @@ from .models import (
     TradingDecision,
 )
 from .status import OperationalStatus, StatusStore
+from .risk import RiskConfig, RiskEvaluation, RiskMode, RiskState, RiskStateService
 
 
 class PersistenceConfigurationError(RuntimeError):
@@ -59,6 +61,9 @@ class OperationalRepository(Protocol):
     def load_status(self) -> OperationalStatus: ...
     def save_status(self, status: OperationalStatus) -> None: ...
     def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
+    def load_risk_state(self, account_key: str = "default") -> RiskState | None: ...
+    def evaluate_risk_state(self, **kwargs: Any) -> RiskEvaluation: ...
+    def reset_critical_risk(self, **kwargs: Any) -> RiskEvaluation: ...
 
 
 class ServiceLock:
@@ -118,6 +123,8 @@ class TradingCycleRow(Base):
     signal_reason: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
     risk_approved: Mapped[bool] = mapped_column(nullable=False, default=False)
     risk_reason: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    risk_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="NORMAL")
+    risk_event_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     portfolio_before: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     portfolio_after: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
@@ -216,6 +223,43 @@ class OperationalStatusRow(Base):
     trading_health: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
     managed_symbols: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    risk_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="NORMAL")
+
+
+class RiskStateRow(Base):
+    __tablename__ = "risk_state"
+    __table_args__ = (
+        CheckConstraint("risk_mode IN ('NORMAL', 'DAILY_HALT', 'CRITICAL_HALT')", name="ck_risk_state_mode"),
+        CheckConstraint("daily_baseline_equity IS NULL OR daily_baseline_equity > 0", name="ck_risk_state_baseline_positive"),
+        CheckConstraint("high_water_equity IS NULL OR high_water_equity > 0", name="ck_risk_state_hwm_positive"),
+        CheckConstraint("transition_sequence >= 0", name="ck_risk_state_transition_sequence_nonnegative"),
+    )
+    account_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    daily_baseline_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    high_water_equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    risk_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="NORMAL")
+    daily_latched: Mapped[bool] = mapped_column(nullable=False, default=False)
+    critical_latched: Mapped[bool] = mapped_column(nullable=False, default=False)
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reset_reason: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    transition_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reset_operator: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+
+class RiskEventRow(Base):
+    __tablename__ = "risk_events"
+    __table_args__ = (CheckConstraint("equity IS NULL OR equity > 0", name="ck_risk_event_equity_positive"),)
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_key: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    event_key: Mapped[str] = mapped_column(String(256), nullable=False, unique=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    equity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str] = mapped_column(String(2000), nullable=False)
+    event_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 def _json_value(value: Any) -> Any:
@@ -243,7 +287,7 @@ def _intent(value: OrderIntent | None) -> dict[str, Any] | None:
 def _snapshot_from_json(value: dict[str, Any] | None) -> PortfolioSnapshot | None:
     if value is None:
         return None
-    return PortfolioSnapshot(datetime.fromisoformat(value["timestamp"]), value["cash"], tuple(Position(item["symbol"], item["shares"], item["average_price"]) for item in value["positions"]), value["asset_value"], value["equity"], value["transaction_costs_paid"])
+    return PortfolioSnapshot(datetime.fromisoformat(value["timestamp"]), value["cash"], tuple(Position(item["symbol"], item["shares"], item["average_price"]) for item in value["positions"]), value["asset_value"], value["equity"], value["transaction_costs_paid"], value.get("realized_pnl", 0.0), value.get("unrealized_pnl", 0.0), value.get("valuation_complete", True), value.get("positions_complete", True))
 
 
 def _intent_from_json(value: dict[str, Any] | None) -> OrderIntent | None:
@@ -262,7 +306,7 @@ def _decision_from_row(row: TradingCycleRow, order_row: OrderRow | None, fill_ro
         side = order.intent.side if order else SignalAction.BUY
         fill = Fill(fill_row.order_id, order_row.symbol if order_row else row.symbol, side, fill_row.quantity, fill_row.price, fill_row.quantity * fill_row.price, fill_row.transaction_cost, fill_row.filled_at)
     risk_intent = _intent_from_json(row.execution_order or row.proposed_order)
-    risk = RiskDecision(row.risk_approved, row.risk_reason, risk_intent)
+    risk = RiskDecision(row.risk_approved, row.risk_reason, risk_intent, row.risk_mode, row.risk_event_type)
     return TradingDecision(row.id, row.created_at, row.symbol, row.strategy_name, row.strategy_parameters or {}, datetime.fromisoformat(row.market_session) if row.market_session else None, SignalAction(row.signal), row.signal_reason, _snapshot_from_json(row.portfolio_before), _intent_from_json(row.proposed_order), risk, order, fill, _snapshot_from_json(row.portfolio_after), row.outcome, row.error, _intent_from_json(row.execution_order), reconciliation or row.reconciliation_payload)
 
 
@@ -357,6 +401,101 @@ class SqlAlchemyOperationalRepository:
                     })
         return list(candidates.values())
 
+    def load_risk_state(self, account_key: str = "default") -> RiskState | None:
+        with Session(self.engine) as session:
+            row = session.get(RiskStateRow, account_key)
+            if row is None:
+                return None
+            return self._risk_state(row)
+
+    @staticmethod
+    def _risk_state(row: RiskStateRow) -> RiskState:
+        return RiskState(
+            row.account_key,
+            row.session_id,
+            Decimal(str(row.daily_baseline_equity)) if row.daily_baseline_equity is not None else None,
+            Decimal(str(row.high_water_equity)) if row.high_water_equity is not None else None,
+            RiskMode(row.risk_mode),
+            row.daily_latched,
+            row.critical_latched,
+            row.last_evaluated_at,
+            row.reset_reason,
+            row.reset_at,
+            row.transition_sequence,
+            row.reset_operator,
+        )
+
+    def _locked_risk_row(self, session: Session, account_key: str) -> RiskStateRow | None:
+        if self.engine.dialect.name == "postgresql":
+            raw = int.from_bytes(hashlib.sha256(f"risk:{account_key}".encode()).digest()[:8], "big", signed=False)
+            lock_id = raw if raw < 2**63 else raw - 2**64
+            session.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": lock_id})
+        return session.scalar(select(RiskStateRow).where(RiskStateRow.account_key == account_key).with_for_update())
+
+    @staticmethod
+    def _apply_risk_state(row: RiskStateRow, state: RiskState) -> None:
+        row.session_id = state.session_id
+        row.daily_baseline_equity = float(state.daily_baseline_equity) if state.daily_baseline_equity is not None else None
+        row.high_water_equity = float(state.high_water_equity) if state.high_water_equity is not None else None
+        row.risk_mode = state.mode.value
+        row.daily_latched = state.daily_latched
+        row.critical_latched = state.critical_latched
+        row.last_evaluated_at = state.last_evaluated_at
+        row.reset_reason = state.reset_reason
+        row.reset_at = state.reset_at
+        row.transition_sequence = state.transition_sequence
+        row.reset_operator = state.reset_operator
+
+    def evaluate_risk_state(self, *, equity: float, session_id: str, timestamp: datetime, reconciled: bool = False, valid_session: bool = False, account_key: str = "default", config: RiskConfig = RiskConfig()) -> RiskEvaluation:
+        service = RiskStateService(config)
+        with Session(self.engine) as session:
+            with session.begin():
+                row = self._locked_risk_row(session, account_key)
+                current = None if row is None else self._risk_state(row)
+                evaluation = service.observe(current, equity=equity, session_id=session_id, timestamp=timestamp, reconciled=reconciled, valid_session=valid_session)
+                state = evaluation.state
+                if row is None:
+                    row = RiskStateRow(account_key=account_key)
+                    session.add(row)
+                self._apply_risk_state(row, state)
+                if evaluation.event_type:
+                    event_key = f"{account_key}:{evaluation.event_type}:{state.transition_sequence}"
+                    session.add(RiskEventRow(id=uuid4().hex, account_key=account_key, event_key=event_key, event_type=evaluation.event_type, session_id=state.session_id, equity=float(equity), reason=evaluation.reason, event_payload={"mode": state.mode.value, "transition_sequence": state.transition_sequence}, created_at=timestamp))
+            return evaluation
+
+    def reset_critical_risk(self, *, equity: float, cash: float, positions: tuple[Position, ...], session_id: str, timestamp: datetime, operator: str, reason: str, account_key: str = "default", config: RiskConfig = RiskConfig()) -> RiskEvaluation:
+        service = RiskStateService(config)
+        with Session(self.engine) as session:
+            with session.begin():
+                row = self._locked_risk_row(session, account_key)
+                if row is None:
+                    raise ValueError("no durable critical halt exists")
+                evaluation = service.reset_critical(self._risk_state(row), equity=equity, session_id=session_id, timestamp=timestamp, operator=operator, reason=reason)
+                state = evaluation.state
+                self._apply_risk_state(row, state)
+                event_key = f"{account_key}:CRITICAL_HALT_RESET:{state.transition_sequence}"
+                session.add(RiskEventRow(id=uuid4().hex, account_key=account_key, event_key=event_key, event_type="CRITICAL_HALT_RESET", session_id=session_id, equity=float(equity), reason=reason.strip(), event_payload={"operator": operator.strip(), "reason": reason.strip(), "transition_sequence": state.transition_sequence}, created_at=timestamp))
+                status = session.get(OperationalStatusRow, 1)
+                if status is None:
+                    status = OperationalStatusRow(id=1, service_state="stopped", trading_state="healthy", market_data_healthy="unknown", updated_at=timestamp)
+                    session.add(status)
+                status.risk_mode = RiskMode.NORMAL.value
+                status.trading_state = "healthy"
+                status.trading_health = "healthy"
+                status.halt_reason = None
+                status.last_error = None
+                status.broker_connected = True
+                status.broker_health = "healthy"
+                status.current_equity = float(equity)
+                status.current_cash = float(cash)
+                status.last_reconciliation_at = timestamp
+                status.latest_completed_session = session_id
+                status.updated_at = timestamp
+                session.execute(delete(ManagedPositionRow))
+                for position in positions:
+                    session.add(ManagedPositionRow(symbol=position.symbol, quantity=position.shares, average_price=position.average_price, broker_updated_at=timestamp, last_reconciled_at=timestamp))
+            return evaluation
+
     def _save_decision_impl(self, decision: TradingDecision) -> None:
         now = decision.timestamp
         with Session(self.engine) as session:
@@ -366,8 +505,13 @@ class SqlAlchemyOperationalRepository:
                     mode = "observation" if decision.outcome.startswith("WOULD") else "paper_execution"
                     row = TradingCycleRow(id=decision.cycle_id, strategy_name=decision.strategy, strategy_version=str(decision.strategy_parameters.get("version", "1")), symbol=decision.symbol, market_session=(decision.data_timestamp or decision.timestamp).isoformat(), mode=mode, signal=decision.signal.value, outcome=decision.outcome, created_at=now, updated_at=now)
                     session.add(row)
-                row.signal = decision.signal.value; row.outcome = decision.outcome; row.updated_at = now; row.strategy_parameters = _json_value(decision.strategy_parameters); row.signal_reason = decision.signal_reason; row.risk_approved = decision.risk_decision.approved; row.risk_reason = decision.risk_decision.reason; row.error = decision.error; row.portfolio_before = _snapshot(decision.portfolio_before); row.portfolio_after = _snapshot(decision.portfolio_after); row.proposed_order = _intent(decision.proposed_order); row.execution_order = _intent(decision.execution_order); row.reconciliation_payload = _json_value(decision.reconciliation)
+                row.signal = decision.signal.value; row.outcome = decision.outcome; row.updated_at = now; row.strategy_parameters = _json_value(decision.strategy_parameters); row.signal_reason = decision.signal_reason; row.risk_approved = decision.risk_decision.approved; row.risk_reason = decision.risk_decision.reason; row.risk_mode = decision.risk_decision.mode; row.risk_event_type = decision.risk_decision.event_type; row.error = decision.error; row.portfolio_before = _snapshot(decision.portfolio_before); row.portfolio_after = _snapshot(decision.portfolio_after); row.proposed_order = _intent(decision.proposed_order); row.execution_order = _intent(decision.execution_order); row.reconciliation_payload = _json_value(decision.reconciliation)
                 session.flush()
+                event_type = decision.risk_decision.event_type
+                if event_type and not decision.risk_decision.approved:
+                    event_key = f"default:decision:{decision.cycle_id}:{event_type}"
+                    if session.scalar(select(RiskEventRow.id).where(RiskEventRow.event_key == event_key)) is None:
+                        session.add(RiskEventRow(id=uuid4().hex, account_key="default", event_key=event_key, event_type=event_type, session_id=decision.data_timestamp.date().isoformat() if decision.data_timestamp else None, equity=decision.portfolio_before.equity if decision.portfolio_before and decision.portfolio_before.equity > 0 else None, reason=decision.risk_decision.reason, event_payload={"cycle_id": decision.cycle_id, "signal": decision.signal.value, "mode": decision.risk_decision.mode, "intent": _intent(decision.execution_order or decision.proposed_order)}, created_at=now))
                 if decision.submitted_order:
                     order = session.get(OrderRow, decision.submitted_order.order_id)
                     intent = decision.submitted_order.intent
@@ -398,13 +542,13 @@ class SqlAlchemyOperationalRepository:
             if row is None:
                 return OperationalStatus()
             positions = tuple(Position(item.symbol, item.quantity, item.average_price or 0.0) for item in session.scalars(select(ManagedPositionRow)).all())
-            return OperationalStatus(state=row.service_state, last_cycle_id=row.last_cycle_id, last_cycle_timestamp=row.last_cycle_timestamp, last_cycle_outcome=row.last_cycle_outcome, last_error=row.last_error, current_equity=row.current_equity, current_cash=row.current_cash, current_positions=positions, most_recent_market_data_timestamp=row.most_recent_market_data_timestamp, mode=row.mode, execution_enabled=row.execution_enabled, broker_connected=row.broker_connected, last_reconciliation_status=None, unresolved_symbols=tuple(), broker_health=row.broker_health, market_data_health=row.market_data_healthy, latest_completed_session=row.latest_completed_session, next_scheduled_decision=row.next_decision_at, last_reconciliation_timestamp=row.last_reconciliation_at, unresolved_order_count=row.unresolved_order_count, trading_health=row.trading_state, halt_reason=row.halt_reason, managed_symbols=tuple(row.managed_symbols or []))
+            return OperationalStatus(state=row.service_state, last_cycle_id=row.last_cycle_id, last_cycle_timestamp=row.last_cycle_timestamp, last_cycle_outcome=row.last_cycle_outcome, last_error=row.last_error, current_equity=row.current_equity, current_cash=row.current_cash, current_positions=positions, most_recent_market_data_timestamp=row.most_recent_market_data_timestamp, mode=row.mode, execution_enabled=row.execution_enabled, broker_connected=row.broker_connected, last_reconciliation_status=None, unresolved_symbols=tuple(), broker_health=row.broker_health, market_data_health=row.market_data_healthy, latest_completed_session=row.latest_completed_session, next_scheduled_decision=row.next_decision_at, last_reconciliation_timestamp=row.last_reconciliation_at, unresolved_order_count=row.unresolved_order_count, trading_health=row.trading_state, halt_reason=row.halt_reason, managed_symbols=tuple(row.managed_symbols or []), risk_mode=getattr(row, "risk_mode", "NORMAL"))
 
     def save_status(self, status: OperationalStatus) -> None:
         updated = status.last_cycle_timestamp or status.next_scheduled_decision or datetime.now().astimezone()
         with Session(self.engine) as session:
             row = session.get(OperationalStatusRow, 1) or OperationalStatusRow(id=1, service_state=status.state, trading_state=status.trading_health, market_data_healthy=status.market_data_health, updated_at=updated)
-            row.service_state = status.state; row.trading_state = status.trading_health; row.halt_reason = status.halt_reason; row.broker_connected = status.broker_connected; row.market_data_healthy = status.market_data_health; row.last_cycle_id = status.last_cycle_id; row.last_cycle_timestamp = status.last_cycle_timestamp; row.last_reconciliation_at = status.last_reconciliation_timestamp; row.latest_completed_session = status.latest_completed_session; row.next_decision_at = status.next_scheduled_decision; row.unresolved_order_count = status.unresolved_order_count; row.last_cycle_outcome = status.last_cycle_outcome; row.last_error = status.last_error; row.current_equity = status.current_equity; row.current_cash = status.current_cash; row.most_recent_market_data_timestamp = status.most_recent_market_data_timestamp; row.mode = status.mode; row.execution_enabled = status.execution_enabled; row.broker_health = status.broker_health; row.trading_health = status.trading_health; row.managed_symbols = list(status.managed_symbols); row.updated_at = updated
+            row.service_state = status.state; row.trading_state = status.trading_health; row.halt_reason = status.halt_reason; row.broker_connected = status.broker_connected; row.market_data_healthy = status.market_data_health; row.last_cycle_id = status.last_cycle_id; row.last_cycle_timestamp = status.last_cycle_timestamp; row.last_reconciliation_at = status.last_reconciliation_timestamp; row.latest_completed_session = status.latest_completed_session; row.next_decision_at = status.next_scheduled_decision; row.unresolved_order_count = status.unresolved_order_count; row.last_cycle_outcome = status.last_cycle_outcome; row.last_error = status.last_error; row.current_equity = status.current_equity; row.current_cash = status.current_cash; row.most_recent_market_data_timestamp = status.most_recent_market_data_timestamp; row.mode = status.mode; row.execution_enabled = status.execution_enabled; row.broker_health = status.broker_health; row.trading_health = status.trading_health; row.managed_symbols = list(status.managed_symbols); row.risk_mode = status.risk_mode; row.updated_at = updated
             session.add(row); session.commit()
 
     # StatusStore-compatible aliases keep AutonomousTrader independent of the

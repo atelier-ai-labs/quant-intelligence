@@ -209,6 +209,12 @@ class AlpacaBroker:
     def _account_equity(self) -> float | None:
         return _float(_value(self._account(), "equity"))
 
+    def get_account_equity(self) -> float:
+        equity = self._account_equity()
+        if equity is None or equity <= 0:
+            raise BrokerUnavailable("Alpaca account did not provide trustworthy positive equity")
+        return equity
+
     def get_positions(self) -> tuple[Position, ...]:
         try:
             remote = self.client.get_all_positions()
@@ -228,9 +234,10 @@ class AlpacaBroker:
     def get_portfolio_snapshot(self, prices: dict[str, float], timestamp: datetime) -> PortfolioSnapshot:
         cash, costs = self.get_account()
         positions = self.get_positions()
-        asset_value = sum(position.shares * prices.get(position.symbol, 0.0) for position in positions)
-        equity = self._account_equity()
-        return PortfolioSnapshot(timestamp, cash, positions, asset_value, equity if equity is not None else cash + asset_value, costs)
+        complete = all(position.symbol in prices and prices[position.symbol] > 0 for position in positions)
+        asset_value = sum(position.shares * prices[position.symbol] for position in positions if position.symbol in prices)
+        equity = self.get_account_equity()
+        return PortfolioSnapshot(timestamp, cash, positions, asset_value, equity, costs, valuation_complete=complete)
 
     def _request(self, intent: OrderIntent) -> Any:
         if self._order_request_builder:

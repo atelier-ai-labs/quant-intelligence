@@ -26,6 +26,7 @@ class AutonomousTrader:
         self.post_close_delay = post_close_delay
         self.reconciliation_service = reconciliation_service
         self.status = status_store.load() if status_store else OperationalStatus()
+        self._sync_durable_risk_status()
         self.status.state = "stopped"
         self.status.managed_symbols = managed_symbols or (symbol,)
         self._persist_status()
@@ -79,7 +80,7 @@ class AutonomousTrader:
         logger.info("scheduler_trigger", extra={"symbol": self.symbol, "session": session_key})
         logger.info("cycle_started", extra={"symbol": self.symbol, "session": session_key})
         try:
-            decision = self.cycle_service.run(self.symbol, now=current)
+            decision = self.cycle_service.run(self.symbol, now=current, reconciled=True, session_id=session_key)
         except Exception as exc:
             self.status.last_error = str(exc)
             self.status.last_cycle_outcome = "FAILED"
@@ -87,11 +88,13 @@ class AutonomousTrader:
             logger.exception("cycle_failed", extra={"symbol": self.symbol})
             self.stop()
             return []
-        self.status.latest_completed_session = session_key
+        if decision.risk_decision.reason != "stale market data":
+            self.status.latest_completed_session = session_key
         self.status.next_scheduled_decision = self.next_decision_time(current)
         self.status.update_from_decision(decision)
-        self.status.trading_health = "healthy" if not decision.error else "halted"
-        self.status.halt_reason = decision.error
+        self.status.risk_mode = decision.risk_decision.mode
+        self.status.trading_health = "healthy" if not decision.error and decision.risk_decision.mode == "NORMAL" else "halted"
+        self.status.halt_reason = decision.error or (None if decision.risk_decision.mode == "NORMAL" else decision.risk_decision.reason)
         self._persist_status()
         self._log_decision(decision)
         return [decision]
@@ -116,6 +119,10 @@ class AutonomousTrader:
                 self.stop()
                 break
             decisions.append(decision)
+            self.status.risk_mode = decision.risk_decision.mode
+            if decision.risk_decision.mode != "NORMAL":
+                self.status.trading_health = "halted"
+                self.status.halt_reason = decision.risk_decision.reason
             self.status.update_from_decision(decision)
             self._persist_status()
             self._log_decision(decision)
@@ -123,11 +130,18 @@ class AutonomousTrader:
 
     def _preflight(self) -> bool:
         broker: Any = self.cycle_service.broker
+        if not self._sync_durable_risk_status():
+            return False
         preflight = getattr(broker, "preflight", None)
         if preflight is None:
-            self.status.trading_health = "healthy"
             self.status.broker_health = "healthy"
             self.status.last_reconciliation_status = "NOT_REQUIRED"
+            if self.status.risk_mode == "NORMAL":
+                self.status.trading_health = "healthy"
+                self.status.halt_reason = None
+            else:
+                self.status.trading_health = "halted"
+                self.status.halt_reason = f"risk mode {self.status.risk_mode}"
             self._persist_status()
             return True
         if self.reconciliation_service is not None:
@@ -154,10 +168,34 @@ class AutonomousTrader:
         self.status.current_positions = tuple(positions)
         self.status.unresolved_symbols = tuple()
         self.status.unresolved_order_count = 0
-        self.status.trading_health = "healthy"
-        self.status.halt_reason = None
+        if self.status.risk_mode == "NORMAL":
+            self.status.trading_health = "healthy"
+            self.status.halt_reason = None
+        else:
+            self.status.trading_health = "halted"
+            self.status.halt_reason = f"risk mode {self.status.risk_mode}"
         self._persist_status()
         logger.info("reconciliation_completed", extra={"symbol": self.symbol})
+        return True
+
+    def _sync_durable_risk_status(self) -> bool:
+        risk_store = getattr(self.cycle_service, "risk_state_store", None)
+        if risk_store is None:
+            return True
+        try:
+            state = risk_store.load_risk_state(getattr(self.cycle_service, "risk_account_key", "default"))
+        except Exception as exc:
+            self.status.risk_mode = "CRITICAL_HALT"
+            self.status.trading_health = "halted"
+            self.status.halt_reason = f"risk state unavailable: {exc}"
+            self.status.last_error = self.status.halt_reason
+            self._persist_status()
+            return False
+        if state is not None:
+            self.status.risk_mode = state.mode.value
+            if state.mode.value != "NORMAL":
+                self.status.trading_health = "halted"
+                self.status.halt_reason = f"risk mode {state.mode.value}"
         return True
 
     def _halt(self, reason: str, *, broker: bool = True) -> None:

@@ -75,8 +75,10 @@ class PaperBroker:
         return order, fill
 
     def get_portfolio_snapshot(self, prices: dict[str, float], timestamp: datetime) -> PortfolioSnapshot:
-        asset_value = sum(position.shares * prices.get(position.symbol, 0.0) for position in self.positions.values())
-        return PortfolioSnapshot(timestamp, self.cash, self.get_positions(), asset_value, self.cash + asset_value, self.transaction_costs_paid)
+        positions = self.get_positions()
+        complete = all(position.symbol in prices and prices[position.symbol] > 0 for position in positions)
+        asset_value = sum(position.shares * prices[position.symbol] for position in positions if position.symbol in prices)
+        return PortfolioSnapshot(timestamp, self.cash, positions, asset_value, self.cash + asset_value, self.transaction_costs_paid, valuation_complete=complete)
 
     def _save_state(self) -> None:
         if self.state_path is None: return

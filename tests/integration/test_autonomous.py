@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from quant_intelligence.trading import AutonomousTrader, FakeClock, IntervalScheduler, PaperBroker, TradingCycleService
 from quant_intelligence.trading.audit import TradingAuditStore
 from quant_intelligence.trading.market import SequencedFixtureMarketDataProvider
-from quant_intelligence.trading.risk import RiskGate
+from quant_intelligence.trading.risk import RiskConfig, RiskGate
 from quant_intelligence.trading.status import StatusStore
 from quant_intelligence.strategies import SmaTrendStrategy
 from tests.integration.test_trading import bars
@@ -13,7 +13,7 @@ START = datetime(2020, 1, 3, 12, tzinfo=timezone.utc)
 def make_trader(tmp_path, provider=None, broker=None, scheduler=None, clock=None):
     provider = provider or SequencedFixtureMarketDataProvider("SYNTH", bars([10, 11, 12, 10, 9]))
     broker = broker or PaperBroker(1000, transaction_cost_bps=0, state_path=tmp_path / "broker.json")
-    cycle = TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=provider, risk_gate=RiskGate(transaction_cost_bps=0), audit_store=TradingAuditStore(tmp_path / "audit"))
+    cycle = TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=provider, risk_gate=RiskGate(transaction_cost_bps=0), audit_store=TradingAuditStore(tmp_path / "audit"), max_execution_shares=15)
     return AutonomousTrader(symbol="SYNTH", cycle_service=cycle, scheduler=scheduler or IntervalScheduler(timedelta(days=1), START), clock=clock or FakeClock(START), status_store=StatusStore(tmp_path / "status.json")), broker, provider
 
 def test_scheduled_cycle_fires_and_updates_status(tmp_path):
@@ -21,7 +21,7 @@ def test_scheduled_cycle_fires_and_updates_status(tmp_path):
     provider.advance(3); trader.start()
     decisions = trader.run_due_cycles()
     assert len(decisions) == 1; assert decisions[0].outcome == "EXECUTED"; assert len(broker.fills) == 1
-    assert trader.status.state == "running"; assert trader.status.last_cycle_id == decisions[0].cycle_id; assert trader.status.current_cash == 4; assert trader.status.current_equity == 1000
+    assert trader.status.state == "running"; assert trader.status.last_cycle_id == decisions[0].cycle_id; assert trader.status.current_cash == 820; assert trader.status.current_equity == 1000
 
 def test_cycle_does_not_fire_before_due_time(tmp_path):
     clock = FakeClock(START - timedelta(hours=1)); trader, broker, provider = make_trader(tmp_path, clock=clock)
@@ -64,4 +64,4 @@ def test_status_persists_across_restart(tmp_path):
     provider = SequencedFixtureMarketDataProvider("SYNTH", bars([10, 11, 12])); provider.advance(3)
     trader, _, _ = make_trader(tmp_path, provider=provider); trader.start(); decision = trader.run_due_cycles()[0]
     restored = StatusStore(tmp_path / "status.json").load()
-    assert restored.last_cycle_id == decision.cycle_id; assert restored.current_positions[0].shares == 83; assert restored.current_equity == 1000
+    assert restored.last_cycle_id == decision.cycle_id; assert restored.current_positions[0].shares == 15; assert restored.current_equity == 1000

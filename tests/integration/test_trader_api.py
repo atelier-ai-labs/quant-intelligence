@@ -9,7 +9,7 @@ from quant_intelligence.trading.audit import TradingAuditStore
 from quant_intelligence.trading.broker import PaperBroker
 from quant_intelligence.trading.cycle import TradingCycleService
 from quant_intelligence.trading.market import FixtureMarketDataProvider
-from quant_intelligence.trading.risk import RiskGate
+from quant_intelligence.trading.risk import RiskConfig, RiskGate
 from quant_intelligence.trading.status import OperationalStatus, StatusStore
 from tests.integration.test_trading import NOW, bars
 
@@ -21,7 +21,7 @@ def seed_trader(tmp_path):
     decision = TradingCycleService(
         strategy=SmaTrendStrategy(3), broker=broker,
         market_data=FixtureMarketDataProvider("SYNTH", bars([10, 11, 12, 13])),
-        risk_gate=RiskGate(transaction_cost_bps=0), audit_store=TradingAuditStore(audit_dir),
+        risk_gate=RiskGate(transaction_cost_bps=0), audit_store=TradingAuditStore(audit_dir), max_execution_shares=15,
     ).run("SYNTH", NOW)
     status_store = StatusStore(audit_dir / "status.json")
     status = OperationalStatus(state="running")
@@ -46,7 +46,7 @@ def test_status_and_portfolio_return_canonical_state(tmp_path):
     portfolio = client.get("/api/trader/portfolio")
     assert portfolio.status_code == 200
     assert portfolio.json()["equity"] == 1000
-    assert portfolio.json()["positions"][0]["quantity"] == 76
+    assert portfolio.json()["positions"][0]["quantity"] == 15
     assert portfolio.json()["positions"][0]["market_value"] is None
 
 
@@ -68,6 +68,21 @@ def test_recent_decisions_are_newest_first_and_limited(tmp_path):
     assert len(response.json()) == 1
     assert response.json()[0]["cycle_id"] == decision.cycle_id
     assert response.json()[0]["signal"] == "BUY"
+
+
+def test_rejected_decision_summary_uses_proposed_intent_without_execution_fields(tmp_path):
+    audit_dir = tmp_path / "audit"
+    broker = PaperBroker(1000, transaction_cost_bps=0)
+    decision = TradingCycleService(
+        strategy=SmaTrendStrategy(3), broker=broker,
+        market_data=FixtureMarketDataProvider("SYNTH", bars([10, 11, 12, 13])),
+        risk_gate=RiskGate(RiskConfig(max_order_notional=1), transaction_cost_bps=0),
+        audit_store=TradingAuditStore(audit_dir),
+    ).run("SYNTH", NOW)
+    assert decision.submitted_order is None and decision.proposed_order is not None
+    client = TestClient(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
+    summary = client.get("/api/trader/decisions").json()[0]
+    assert summary["order"] == {"side": "BUY", "quantity": 76, "status": None}
 
 
 def test_full_decision_detail_and_unknown_id(tmp_path):

@@ -92,7 +92,7 @@ quant-intelligence paper-cycle \
   --timestamp 2020-01-04T12:00:00+00:00
 ```
 
-The fixture produces a BUY for 76 whole shares at the completed close of 13, passes the risk gate, fills in the paper broker, leaves $12 cash, and persists the full decision record plus broker state under the audit directory. Repeating the same cycle identity returns the prior decision rather than submitting a second order.
+The fixture proposes a cash-sized BUY at the completed close of 13, but v0.7 rejects that proposal because its resulting position would exceed the 20%-of-equity cap. The full rejection is persisted under the audit directory, and repeating the same cycle identity returns the prior decision rather than submitting a second order.
 
 For a finite scheduled run, use `paper-run`. It defaults to one scheduled cycle; `--cycles` makes the run explicitly bounded and Ctrl+C stops it cleanly:
 
@@ -152,7 +152,7 @@ Use the no-order validation mode first:
 quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
 ```
 
-After reviewing its reconciliation and scheduling output, an operator can explicitly enable the bounded-risk paper service:
+After reviewing its reconciliation and scheduling output, an operator can explicitly enable the bounded-risk paper service. v0.7 uses durable PostgreSQL risk state: resulting single-position exposure is capped at 20% of current equity, gross exposure and leverage at 1.0x, daily loss at 5%, and high-water drawdown at 30%. Daily halts reset only after reconciliation on a new valid market session; critical halts require an auditable operator reset. Future planned 1% per-trade risk is documented only, because this version has no stop/invalidation price and does not enforce it. The limits scale from equity; dollar examples are illustrative only.
 
 ```bash
 quant-intelligence alpaca-run --symbol SPY --window 200

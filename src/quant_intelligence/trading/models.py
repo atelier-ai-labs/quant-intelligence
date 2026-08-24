@@ -64,12 +64,18 @@ class PortfolioSnapshot:
     asset_value: float
     equity: float
     transaction_costs_paid: float
+    realized_pnl: float = 0.0
+    unrealized_pnl: float = 0.0
+    valuation_complete: bool = True
+    positions_complete: bool = True
 
 @dataclass(frozen=True)
 class RiskDecision:
     approved: bool
     reason: str
     intent: OrderIntent | None
+    mode: str = "NORMAL"
+    event_type: str | None = None
 
 @dataclass(frozen=True)
 class TradingDecision:

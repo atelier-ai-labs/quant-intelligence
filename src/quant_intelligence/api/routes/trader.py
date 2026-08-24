@@ -43,7 +43,8 @@ def _load_status(request: Request) -> OperationalStatus | None:
 
 
 def _decision_summary(decision: TradingDecision) -> dict[str, Any]:
-    order = decision.submitted_order or decision.proposed_order
+    submitted = decision.submitted_order
+    proposed = decision.proposed_order
     return _json_value({
         "cycle_id": decision.cycle_id,
         "timestamp": decision.timestamp,
@@ -53,12 +54,14 @@ def _decision_summary(decision: TradingDecision) -> dict[str, Any]:
         "risk": {
             "approved": decision.risk_decision.approved,
             "reason": decision.risk_decision.reason,
+            "mode": decision.risk_decision.mode,
+            "event_type": decision.risk_decision.event_type,
         },
         "order": {
-            "side": order.intent.side,
-            "quantity": order.intent.quantity,
-            "status": decision.submitted_order.status if decision.submitted_order else None,
-        } if order else None,
+            "side": submitted.intent.side if submitted else proposed.side,
+            "quantity": submitted.intent.quantity if submitted else proposed.quantity,
+            "status": submitted.status if submitted else None,
+        } if submitted or proposed else None,
         "fill": {
             "price": decision.fill.price,
             "quantity": decision.fill.quantity,

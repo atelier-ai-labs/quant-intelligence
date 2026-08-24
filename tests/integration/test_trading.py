@@ -22,7 +22,7 @@ def bars(closes: list[float], opens: list[float] | None = None) -> list[Bar]:
 def service(tmp_path, data, *, broker=None, risk=None, provider=None):
     broker = broker or PaperBroker(1000, transaction_cost_bps=100)
     provider = provider or FixtureMarketDataProvider("SYNTH", data)
-    return TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=provider, risk_gate=risk or RiskGate(transaction_cost_bps=100), audit_store=TradingAuditStore(tmp_path / "audit")), broker
+    return TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=provider, risk_gate=risk or RiskGate(transaction_cost_bps=100), audit_store=TradingAuditStore(tmp_path / "audit"), max_execution_shares=15), broker
 
 def test_paper_broker_buy_sell_reconciles_with_costs():
     broker = PaperBroker(1000, transaction_cost_bps=100)
@@ -54,10 +54,10 @@ def test_paper_broker_rejects_insufficient_cash_overselling_and_fractional_quant
 
 def test_risk_gate_accepts_valid_order_and_rejects_hard_limits():
     snapshot = PortfolioSnapshot(NOW, 1000, (), 0, 1000, 0)
-    gate = RiskGate(RiskConfig(max_position_allocation=0.5, max_order_notional=400), transaction_cost_bps=0)
+    gate = RiskGate(RiskConfig(max_position_allocation=0.2, max_order_notional=400), transaction_cost_bps=0)
     assert gate.evaluate(OrderIntent("SYNTH", SignalAction.BUY, 20), snapshot, 10).approved
     assert "notional" in gate.evaluate(OrderIntent("SYNTH", SignalAction.BUY, 41), snapshot, 10).reason
-    assert "allocation" in gate.evaluate(OrderIntent("SYNTH", SignalAction.BUY, 51), snapshot, 10).reason or "notional" in gate.evaluate(OrderIntent("SYNTH", SignalAction.BUY, 51), snapshot, 10).reason
+    assert "allocation" in gate.evaluate(OrderIntent("SYNTH", SignalAction.BUY, 21), snapshot, 10).reason
     assert "positive" in gate.evaluate(OrderIntent("SYNTH", SignalAction.BUY, 0), snapshot, 10).reason
     assert "owned" in gate.evaluate(OrderIntent("SYNTH", SignalAction.SELL, 1), snapshot, 10).reason
 
@@ -65,7 +65,7 @@ def test_buy_cycle_executes_and_persists_audit_record(tmp_path):
     trading, broker = service(tmp_path, bars([10, 11, 12, 13]))
     decision = trading.run("SYNTH", NOW)
     assert decision.signal == SignalAction.BUY; assert decision.outcome == "EXECUTED"
-    assert decision.fill is not None; assert decision.portfolio_before.equity == 1000; assert decision.portfolio_after.positions[0].shares == 76
+    assert decision.fill is not None; assert decision.portfolio_before.equity == 1000; assert decision.portfolio_after.positions[0].shares == 15
     saved = json.loads(next((tmp_path / "audit").glob("*.json")).read_text())
     assert {"cycle_id", "signal", "portfolio_before", "proposed_order", "risk_decision", "submitted_order", "fill", "portfolio_after", "outcome"} <= saved.keys()
     assert len(broker.orders) == 1

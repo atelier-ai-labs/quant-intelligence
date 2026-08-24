@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import os
 import signal
 import time
 from threading import Event
@@ -20,8 +21,8 @@ from quant_intelligence.trading.alpaca import AlpacaBroker, AlpacaConfig, Alpaca
 from quant_intelligence.trading.broker import BrokerError
 from quant_intelligence.trading.reconciliation import BrokerReconciliation
 from quant_intelligence.trading.sessions import AlpacaMarketSessionProvider
-from quant_intelligence.trading.persistence import operational_repository
-from quant_intelligence.trading.runtime import RuntimeConfigurationError, ServiceAlreadyRunning, ServiceConfig, build_persistent_service
+from quant_intelligence.trading.persistence import PersistenceConfigurationError, operational_repository
+from quant_intelligence.trading.runtime import CriticalResetError, CriticalRiskResetService, RuntimeConfigurationError, ServiceAlreadyRunning, ServiceConfig, build_persistent_service
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="quant-intelligence")
@@ -48,10 +49,13 @@ def main() -> None:
     mode = a.add_mutually_exclusive_group(); mode.add_argument("--observe", action="store_true", help="observation-only mode; never submits an order"); mode.add_argument("--execute", action="store_true", help="submit only to explicitly configured Alpaca paper account")
     ar = sub.add_parser("alpaca-run", help="run the session-aware autonomous Alpaca paper trader")
     ar.add_argument("--symbol", default="SPY"); ar.add_argument("--window", type=int, default=200); ar.add_argument("--audit-dir", default="alpaca_audit")
-    ar.add_argument("--post-close-delay-minutes", type=float, default=5.0); ar.add_argument("--max-position-allocation", type=float, default=0.25)
+    ar.add_argument("--post-close-delay-minutes", type=float, default=5.0); ar.add_argument("--max-position-allocation", type=float, default=0.20)
     ar.add_argument("--max-order-notional", type=float, default=2500.0); ar.add_argument("--max-order-shares", type=int, default=10)
     ar.add_argument("--dry-run-once", action="store_true", help="reconcile and show the next/current decision without submitting")
     sub.add_parser("alpaca-service", help="run the environment-configured supervised Alpaca paper trader")
+    reset = sub.add_parser("alpaca-risk-reset", help="audited critical-risk reset; never submits an order")
+    reset.add_argument("--reason", required=True)
+    reset.add_argument("--operator", required=True)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "backtest":
@@ -103,7 +107,10 @@ def main() -> None:
         now = datetime.now(timezone.utc)
         provider = AlpacaMarketDataProvider(args.symbol, args.window, execution_config)
         broker = AlpacaBroker(execution_config, state_path=Path(args.audit_dir) / "alpaca_orders.json")
-        repository = operational_repository(args.audit_dir)
+        try:
+            repository = operational_repository(args.audit_dir, database_url=os.getenv("DATABASE_URL") if args.execute else None, mode="postgres" if args.execute else "json")
+        except PersistenceConfigurationError as exc:
+            parser.error(f"Alpaca execution requires PostgreSQL operational persistence: {exc}")
         if args.max_order_shares is not None and args.max_order_shares < 1:
             parser.error("--max-order-shares must be positive")
         if args.poll_attempts < 1 or args.poll_seconds < 0:
@@ -114,7 +121,7 @@ def main() -> None:
             except BrokerError as exc:
                 parser.error(f"Alpaca preflight refused execution: {exc}")
             print(f"MODE: ALPACA PAPER EXECUTION\nSYMBOL: {args.symbol}\nMAX EXECUTION QUANTITY: {args.max_order_shares or 'strategy-sized'} SHARE(S)\nBROKER: PAPER")
-        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(), audit_store=repository, execution_mode="paper_execution" if args.execute else "observation", max_execution_shares=args.max_order_shares)
+        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(), audit_store=repository, execution_mode="paper_execution" if args.execute else "observation", max_execution_shares=args.max_order_shares, risk_state_store=repository if args.execute else None)
         decision = service.run(args.symbol, now)
         if args.execute and decision.submitted_order is not None:
             observed_order, observed_fill = broker.poll_order(decision.submitted_order, attempts=args.poll_attempts, interval_seconds=args.poll_seconds)
@@ -142,16 +149,20 @@ def main() -> None:
             parser.error("alpaca-run requires APCA_EXECUTION_ENABLED=true; use --dry-run-once for validation")
         if args.max_order_shares < 1:
             parser.error("--max-order-shares must be positive")
-        if args.max_order_notional <= 0 or not 0 < args.max_position_allocation <= 1:
-            parser.error("risk limits must be positive and allocation must be in (0, 1]")
+        if args.max_order_notional <= 0 or not 0 < args.max_position_allocation <= 0.20:
+            parser.error("risk limits must be positive and allocation must be in (0, 0.20]")
         audit_dir = Path(args.audit_dir)
         execution_config = replace(config, execution_enabled=bool(config.execution_enabled and not args.dry_run_once))
         provider = AlpacaMarketDataProvider(args.symbol, args.window, execution_config)
         broker = AlpacaBroker(execution_config, state_path=audit_dir / "alpaca_orders.json")
         session_provider = AlpacaMarketSessionProvider(broker.client)
-        repository = operational_repository(audit_dir)
+        try:
+            repository = operational_repository(audit_dir, database_url=os.getenv("DATABASE_URL") if execution_config.execution_enabled else None, mode="postgres" if execution_config.execution_enabled else "json")
+        except PersistenceConfigurationError as exc:
+            parser.error(f"Alpaca execution requires PostgreSQL operational persistence: {exc}")
         reconciliation_service = BrokerReconciliation(broker, audit_dir / "reconciliation", repository=repository)
-        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(RiskConfig(max_position_allocation=args.max_position_allocation, max_order_notional=args.max_order_notional)), audit_store=repository, execution_mode="paper_execution" if execution_config.execution_enabled else "observation", max_execution_shares=args.max_order_shares)
+        risk_config = RiskConfig(max_position_allocation=args.max_position_allocation, max_order_notional=args.max_order_notional)
+        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(risk_config), audit_store=repository, execution_mode="paper_execution" if execution_config.execution_enabled else "observation", max_execution_shares=args.max_order_shares, risk_state_store=repository if execution_config.execution_enabled else None, risk_config=risk_config)
         trader = AutonomousTrader(symbol=args.symbol, cycle_service=service, scheduler=None, clock=SystemClock(), status_store=repository, session_provider=session_provider, post_close_delay=timedelta(minutes=args.post_close_delay_minutes), reconciliation_service=reconciliation_service)
         trader.start()
         try:
@@ -202,3 +213,22 @@ def main() -> None:
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+    elif args.command == "alpaca-risk-reset":
+        if not args.reason.strip() or not args.operator.strip():
+            parser.error("--operator and --reason must be non-empty")
+        repository = None
+        try:
+            config = ServiceConfig.from_env()
+            repository = operational_repository(config.audit_dir, database_url=config.database_url, mode="postgres")
+            broker = AlpacaBroker(config.alpaca, state_path=config.audit_dir / "alpaca_orders.json")
+            reconciliation = BrokerReconciliation(broker, config.audit_dir / "reconciliation", repository=repository)
+            service = CriticalRiskResetService(repository=repository, broker=broker, reconciliation_service=reconciliation, session_provider=AlpacaMarketSessionProvider(broker.client), symbol=config.symbol, lock_name=config.service_lock_name, clock=SystemClock(), post_close_delay=timedelta(minutes=config.post_close_delay_minutes))
+            evaluation = service.reset(operator=args.operator, reason=args.reason)
+            print(json.dumps({"mode": evaluation.state.mode.value, "operator": args.operator.strip(), "reason": args.reason.strip(), "orders_submitted": 0}, indent=2))
+        except (RuntimeConfigurationError, CriticalResetError, BrokerError, ValueError) as exc:
+            parser.error(str(exc))
+        finally:
+            if repository is not None:
+                close = getattr(repository, "close", None)
+                if close is not None:
+                    close()

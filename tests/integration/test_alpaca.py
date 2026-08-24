@@ -10,7 +10,7 @@ from quant_intelligence.trading.broker import BrokerError, BrokerSubmissionUnkno
 from quant_intelligence.trading.cycle import TradingCycleService
 from quant_intelligence.trading.models import Order, OrderIntent, Position, SignalAction
 from quant_intelligence.trading.reconciliation import BrokerReconciliation
-from quant_intelligence.trading.risk import RiskGate
+from quant_intelligence.trading.risk import RiskConfig, RiskGate
 
 NOW = datetime(2020, 1, 4, 12, tzinfo=timezone.utc)
 
@@ -181,7 +181,7 @@ def test_observation_cycle_uses_real_adapter_boundary_without_submitting(tmp_pat
     market, _ = provider([alpaca_bar(1, 10), alpaca_bar(2, 11), alpaca_bar(3, 12)])
     client = FakeTradingClient(remote_order("new"))
     broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=False), trading_client=client, order_request_builder=build_request)
-    decision = TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=market, risk_gate=RiskGate(transaction_cost_bps=0), audit_store=TradingAuditStore(tmp_path / "audit")).run("SYNTH", NOW)
+    decision = TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=market, risk_gate=RiskGate(transaction_cost_bps=0), audit_store=TradingAuditStore(tmp_path / "audit"), max_execution_shares=1).run("SYNTH", NOW)
     assert decision.outcome == "WOULD_BUY"
     assert client.submitted == []
 

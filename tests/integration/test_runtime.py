@@ -4,12 +4,17 @@ from threading import Event
 import pytest
 
 from quant_intelligence.trading.runtime import (
+    CriticalResetError,
+    CriticalRiskResetService,
     PersistentTraderService,
     RuntimeConfigurationError,
     ServiceAlreadyRunning,
     ServiceConfig,
 )
+from quant_intelligence.trading.models import Position
+from quant_intelligence.trading.risk import RiskEvaluation, RiskMode, RiskState
 from quant_intelligence.trading.status import OperationalStatus
+from quant_intelligence.cli import main as cli_main
 
 
 def valid_environment():
@@ -108,6 +113,8 @@ def test_service_configuration_accepts_safe_paper_runtime():
     assert config.alpaca.paper is True
     assert config.alpaca.execution_enabled is True
     assert config.window == 200
+    assert config.max_position_allocation == 0.20
+    assert config.max_gross_exposure == 1.0 and config.max_leverage == 1.0
 
 
 @pytest.mark.parametrize(
@@ -118,6 +125,9 @@ def test_service_configuration_accepts_safe_paper_runtime():
         ({"APCA_PAPER": "false"}, "live mode"),
         ({"APCA_EXECUTION_ENABLED": "false"}, "EXECUTION_ENABLED"),
         ({"QI_MAX_ORDER_SHARES": "0"}, "MAX_ORDER_SHARES"),
+        ({"QI_MAX_POSITION_ALLOCATION": "0.2001"}, "at most 0.2"),
+        ({"QI_MAX_GROSS_EXPOSURE": "1.01"}, "at most 1.0"),
+        ({"QI_MAX_LEVERAGE": "1.01"}, "at most 1.0"),
     ],
 )
 def test_service_configuration_fails_closed(change, message):
@@ -142,6 +152,18 @@ def test_unresolved_startup_reconciliation_blocks_strategy():
     service.run(max_iterations=1)
     assert "strategy_cycle" not in events
     assert events.count("reconciled") == 2
+
+
+def test_portfolio_risk_halt_still_reaches_due_session_evaluation():
+    events = []
+    trader = Trader(events)
+    trader.status.risk_mode = "DAILY_HALT"
+    trader.status.trading_health = "halted"
+    trader.status.broker_health = "healthy"
+    trader.status.last_reconciliation_status = "HEALTHY"
+    service = PersistentTraderService(trader=trader, repository=Repository(events), lock_name="qi-test")
+    service.run(max_iterations=1)
+    assert "strategy_cycle" in events
 
 
 def test_second_instance_is_refused_before_trader_start():
@@ -174,3 +196,79 @@ def test_pre_requested_shutdown_is_graceful_and_never_runs_strategy():
     assert "reconciled" not in events
     assert "strategy_cycle" not in events
     assert "lock_released" in events
+
+
+def test_critical_reset_is_exclusive_broker_verified_and_order_free():
+    events = []
+
+    class ResetRepository(Repository):
+        def reset_critical_risk(self, **kwargs):
+            events.append(("reset", kwargs))
+            return RiskEvaluation(RiskState(session_id=kwargs["session_id"], mode=RiskMode.NORMAL), "reset", "CRITICAL_HALT_RESET")
+
+    class Broker:
+        config = type("Config", (), {"paper": True})()
+        submitted = 0
+
+        def preflight(self, symbol):
+            events.append("preflight")
+            return 600.0, (Position(symbol, 10, 10.0),)
+
+        def get_account_equity(self):
+            events.append("equity")
+            return 700.0
+
+        def submit_order(self, *args, **kwargs):
+            self.submitted += 1
+
+    class Reconciliation:
+        def reconcile_pending(self, symbol=None):
+            events.append("reconciled")
+            return []
+
+    class Sessions:
+        def latest_completed_session(self, now, delay):
+            return type("Session", (), {"session_date": now.date()})()
+
+    broker = Broker()
+    repository = ResetRepository(events)
+    service = CriticalRiskResetService(repository=repository, broker=broker, reconciliation_service=Reconciliation(), session_provider=Sessions(), symbol="SPY", lock_name="qi-test", clock=Clock())
+    result = service.reset(operator="ops@example.com", reason="verified account and incident")
+    assert result.state.mode == RiskMode.NORMAL and broker.submitted == 0
+    reset_kwargs = next(item[1] for item in events if isinstance(item, tuple) and item[0] == "reset")
+    assert reset_kwargs["equity"] == 700 and reset_kwargs["cash"] == 600
+    assert reset_kwargs["operator"] == "ops@example.com" and reset_kwargs["reason"] == "verified account and incident"
+    assert events.index("lock:qi-test") < events.index("reconciled") < events.index("preflight") < events.index("equity")
+    assert "lock_released" in events
+
+
+def test_critical_reset_refuses_missing_identity_lock_and_unresolved_state():
+    class Broker:
+        config = type("Config", (), {"paper": True})()
+
+    class Sessions:
+        def latest_completed_session(self, now, delay):
+            return type("Session", (), {"session_date": now.date()})()
+
+    with pytest.raises(CriticalResetError, match="identity"):
+        CriticalRiskResetService(repository=Repository([], lock=True), broker=Broker(), reconciliation_service=object(), session_provider=Sessions(), symbol="SPY", lock_name="qi", clock=Clock()).reset(operator="", reason="reason")
+    with pytest.raises(CriticalResetError, match="advisory lock"):
+        CriticalRiskResetService(repository=Repository([], lock=False), broker=Broker(), reconciliation_service=object(), session_provider=Sessions(), symbol="SPY", lock_name="qi", clock=Clock()).reset(operator="ops", reason="reason")
+    class Unresolved:
+        def reconcile_pending(self, symbol=None):
+            return [type("Result", (), {"status": "UNKNOWN"})()]
+    events = []
+    with pytest.raises(CriticalResetError, match="unresolved"):
+        CriticalRiskResetService(repository=Repository(events), broker=Broker(), reconciliation_service=Unresolved(), session_provider=Sessions(), symbol="SPY", lock_name="qi", clock=Clock()).reset(operator="ops", reason="reason")
+    assert "lock_released" in events
+
+
+def test_critical_reset_cli_requires_operator_and_has_no_equity_override(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["quant-intelligence", "alpaca-risk-reset", "--reason", "verified"])
+    with pytest.raises(SystemExit) as missing_operator:
+        cli_main()
+    assert missing_operator.value.code == 2
+    monkeypatch.setattr("sys.argv", ["quant-intelligence", "alpaca-risk-reset", "--operator", "ops", "--reason", "verified", "--equity", "999999"])
+    with pytest.raises(SystemExit) as equity_override:
+        cli_main()
+    assert equity_override.value.code == 2

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from threading import Event
 from typing import Any, Callable, Mapping
@@ -30,6 +30,61 @@ class RuntimeConfigurationError(RuntimeError):
 
 class ServiceAlreadyRunning(RuntimeError):
     pass
+
+
+class CriticalResetError(RuntimeError):
+    pass
+
+
+class CriticalRiskResetService:
+    """Exclusive, broker-verified operator reset; never submits an order."""
+
+    def __init__(self, *, repository: Any, broker: Any, reconciliation_service: Any, session_provider: Any, symbol: str, lock_name: str, clock: Any, post_close_delay: timedelta = timedelta(minutes=5)):
+        self.repository = repository
+        self.broker = broker
+        self.reconciliation_service = reconciliation_service
+        self.session_provider = session_provider
+        self.symbol = symbol
+        self.lock_name = lock_name
+        self.clock = clock
+        self.post_close_delay = post_close_delay
+
+    def reset(self, *, operator: str, reason: str) -> Any:
+        if not operator.strip() or not reason.strip():
+            raise CriticalResetError("operator identity and reason are required")
+        if not getattr(getattr(self.broker, "config", None), "paper", False):
+            raise CriticalResetError("critical reset requires an Alpaca PAPER broker")
+        self.repository.ensure_connection()
+        lease = self.repository.acquire_service_lock(self.lock_name)
+        if lease is None:
+            raise CriticalResetError("running service owns the advisory lock")
+        try:
+            lease.ensure_held()
+            now = self.clock.now()
+            session = self.session_provider.latest_completed_session(now, self.post_close_delay)
+            if session is None:
+                raise CriticalResetError("no valid completed market session is available")
+            results = self.reconciliation_service.reconcile_pending()
+            if any(result.status in {"UNKNOWN", "UNRESOLVED", "MISMATCH", "MISSING"} for result in results):
+                raise CriticalResetError("broker reconciliation is unresolved")
+            try:
+                cash, positions = self.broker.preflight(self.symbol)
+                equity = self.broker.get_account_equity()
+            except Exception as exc:
+                raise CriticalResetError(f"broker state is untrustworthy: {exc}") from exc
+            if equity <= 0 or cash < 0:
+                raise CriticalResetError("broker account values are invalid")
+            return self.repository.reset_critical_risk(
+                equity=equity,
+                cash=cash,
+                positions=tuple(positions),
+                session_id=session.session_date.isoformat(),
+                timestamp=now,
+                operator=operator.strip(),
+                reason=reason.strip(),
+            )
+        finally:
+            lease.release()
 
 
 def _integer(env: Mapping[str, str], name: str, default: int, *, minimum: int = 1) -> int:
@@ -61,11 +116,28 @@ class ServiceConfig:
     window: int = 200
     audit_dir: Path = Path("alpaca_audit")
     post_close_delay_minutes: float = 5.0
-    max_position_allocation: float = 0.25
+    max_position_allocation: float = 0.20
+    max_gross_exposure: float = 1.00
+    max_leverage: float = 1.00
+    daily_loss_limit: float = 0.05
+    critical_drawdown_limit: float = 0.30
     max_order_notional: float = 2500.0
     max_order_shares: int = 10
     reconciliation_interval_seconds: float = 60.0
     service_lock_name: str = "quant-intelligence:alpaca-paper"
+
+    def __post_init__(self) -> None:
+        try:
+            RiskConfig(
+                max_position_allocation=self.max_position_allocation,
+                max_gross_exposure=self.max_gross_exposure,
+                max_leverage=self.max_leverage,
+                daily_loss_limit=self.daily_loss_limit,
+                critical_drawdown_limit=self.critical_drawdown_limit,
+                max_order_notional=self.max_order_notional,
+            )
+        except ValueError as exc:
+            raise RuntimeConfigurationError(str(exc)) from exc
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "ServiceConfig":
@@ -94,7 +166,11 @@ class ServiceConfig:
             window=_integer(env, "QI_SMA_WINDOW", 200, minimum=2),
             audit_dir=Path(env.get("QI_AUDIT_DIR", "alpaca_audit")),
             post_close_delay_minutes=_number(env, "QI_POST_CLOSE_DELAY_MINUTES", 5.0),
-            max_position_allocation=_number(env, "QI_MAX_POSITION_ALLOCATION", 0.25, maximum=1.0),
+            max_position_allocation=_number(env, "QI_MAX_POSITION_ALLOCATION", 0.20, maximum=0.20),
+            max_gross_exposure=_number(env, "QI_MAX_GROSS_EXPOSURE", 1.00, maximum=1.0),
+            max_leverage=_number(env, "QI_MAX_LEVERAGE", 1.00, maximum=1.0),
+            daily_loss_limit=_number(env, "QI_DAILY_LOSS_LIMIT", 0.05, maximum=1.0),
+            critical_drawdown_limit=_number(env, "QI_CRITICAL_DRAWDOWN_LIMIT", 0.30, maximum=1.0),
             max_order_notional=_number(env, "QI_MAX_ORDER_NOTIONAL", 2500.0),
             max_order_shares=_integer(env, "QI_MAX_ORDER_SHARES", 10),
             reconciliation_interval_seconds=_number(env, "QI_RECONCILIATION_INTERVAL_SECONDS", 60.0),
@@ -145,7 +221,8 @@ class PersistentTraderService:
             while not self.stop_event.is_set() and (max_iterations is None or iterations < max_iterations):
                 self._lock.ensure_held()
                 self.repository.ensure_connection()
-                if self.trader.status.trading_health != "healthy" or self.trader.status.unresolved_symbols:
+                operationally_unsafe = bool(self.trader.status.unresolved_symbols) or self.trader.status.broker_health == "unavailable" or self.trader.status.last_reconciliation_status == "BLOCKED"
+                if operationally_unsafe:
                     self.trader.reconcile_now()
                 else:
                     self.trader.run_due_cycles()
@@ -181,7 +258,7 @@ class PersistentTraderService:
     def _next_wait_seconds(self) -> float:
         if self.trader is None:
             return self.reconciliation_interval_seconds
-        if self.trader.status.unresolved_symbols or self.trader.status.trading_health != "healthy":
+        if self.trader.status.unresolved_symbols or self.trader.status.broker_health == "unavailable" or self.trader.status.last_reconciliation_status == "BLOCKED":
             return self.reconciliation_interval_seconds
         next_time = self.trader.next_decision_time()
         if next_time is None:
@@ -201,10 +278,12 @@ def build_persistent_service(config: ServiceConfig, *, stop_event: Event | None 
             strategy=SmaTrendStrategy(config.window),
             broker=broker,
             market_data=provider,
-            risk_gate=RiskGate(RiskConfig(max_position_allocation=config.max_position_allocation, max_order_notional=config.max_order_notional)),
+            risk_gate=RiskGate(RiskConfig(max_position_allocation=config.max_position_allocation, max_gross_exposure=config.max_gross_exposure, max_leverage=config.max_leverage, daily_loss_limit=config.daily_loss_limit, critical_drawdown_limit=config.critical_drawdown_limit, max_order_notional=config.max_order_notional)),
             audit_store=repository,
             execution_mode="paper_execution",
             max_execution_shares=config.max_order_shares,
+            risk_state_store=repository,
+            risk_config=RiskConfig(max_position_allocation=config.max_position_allocation, max_gross_exposure=config.max_gross_exposure, max_leverage=config.max_leverage, daily_loss_limit=config.daily_loss_limit, critical_drawdown_limit=config.critical_drawdown_limit, max_order_notional=config.max_order_notional),
         )
         trader = AutonomousTrader(
             symbol=config.symbol,
