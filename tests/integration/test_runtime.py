@@ -57,6 +57,9 @@ class Repository:
         self.events.append(f"lock:{name}")
         return Lease(self.events) if self.lock else None
 
+    def record_operational_event(self, event_type, **kwargs):
+        self.events.append(f"operational:{event_type}")
+
     def close(self):
         self.events.append("repository_closed")
 
@@ -143,7 +146,7 @@ def test_startup_reconciles_before_strategy_execution_and_releases_resources():
     service.run(max_iterations=1)
     assert events.index("persistence_checked") < events.index("lock:qi-test") < events.index("trader_started")
     assert events.index("reconciled") < events.index("strategy_cycle")
-    assert events[-3:] == ["trader_stopped", "lock_released", "repository_closed"]
+    assert events[-6:] == ["trader_stopped", "operational:TRADER_STOPPED", "lock_released", "operational:SERVICE_LOCK_RELEASED", "operational:SERVICE_STOPPED", "repository_closed"]
 
 
 def test_unresolved_startup_reconciliation_blocks_strategy():

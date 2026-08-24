@@ -195,28 +195,53 @@ class PersistentTraderService:
 
     def request_stop(self) -> None:
         logger.info("service_stop_requested")
+        self._record_event("SERVICE_STOP_REQUESTED", reason="termination requested")
         self.stop_event.set()
+
+    def _record_event(self, event_type: str, *, reason: str | None = None, event_key: str | None = None, required: bool = False) -> bool:
+        recorder = getattr(self.repository, "record_operational_event", None)
+        if recorder is None:
+            if required:
+                raise RuntimeError("durable operational-event persistence is unavailable")
+            return False
+        try:
+            status = self.trader.status if self.trader is not None else None
+            recorder(event_type, timestamp=datetime.now().astimezone(), event_key=event_key, service_state=status.state if status else None, trading_health=status.trading_health if status else None, risk_mode=status.risk_mode if status else None, reason=reason)
+            return True
+        except Exception:
+            # Lifecycle evidence is useful but must not mask the existing
+            # fail-closed service path or leak a database error to stdout.
+            logger.warning("operational_event_persist_failed", extra={"event_type": event_type})
+            if required:
+                raise RuntimeError("durable operational-event persistence failed") from None
+            return False
 
     def run(self, *, max_iterations: int | None = None) -> None:
         logger.info("service_starting", extra={"symbol": self.symbol})
+        self._record_event("SERVICE_STARTING")
         started = False
         try:
             self.repository.ensure_connection()
             logger.info("persistence_ready")
+            self._record_event("PERSISTENCE_READY", required=True)
             self._lock = self.repository.acquire_service_lock(self.lock_name)
             if self._lock is None:
                 raise ServiceAlreadyRunning("another Quant Intelligence service instance owns the runtime lock")
             logger.info("service_lock_acquired")
+            self._record_event("SERVICE_LOCK_ACQUIRED", required=True)
             if self.stop_event.is_set():
                 return
             if self.trader is None:
                 self.trader = self._trader_factory()  # type: ignore[misc]
             self.trader.start()
             started = True
+            self._record_event("TRADER_STARTED", required=True)
             if not self.trader.reconcile_now():
                 logger.error("trading_halted", extra={"reason": self.trader.status.halt_reason})
+                self._record_event("STARTUP_RECONCILIATION_FAILED", reason=self.trader.status.halt_reason)
             else:
                 logger.info("startup_reconciliation_ready")
+                self._record_event("STARTUP_RECONCILIATION_READY", required=True)
             iterations = 0
             while not self.stop_event.is_set() and (max_iterations is None or iterations < max_iterations):
                 self._lock.ensure_held()
@@ -240,16 +265,20 @@ class PersistentTraderService:
                 except Exception:
                     logger.error("status_persistence_failed")
             logger.exception("service_fatal_failure", extra={"error_type": type(exc).__name__})
+            self._record_event("SERVICE_FATAL_FAILURE", reason=type(exc).__name__)
             raise
         finally:
             if started and self.trader is not None:
                 try:
                     self.trader.stop()
+                    self._record_event("TRADER_STOPPED")
                 except Exception:
                     logger.exception("service_shutdown_status_failed")
             if self._lock is not None:
                 self._lock.release()
                 logger.info("service_lock_released")
+                self._record_event("SERVICE_LOCK_RELEASED")
+            self._record_event("SERVICE_STOPPED")
             close = getattr(self.repository, "close", None)
             if close is not None:
                 close()

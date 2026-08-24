@@ -22,6 +22,7 @@ from quant_intelligence.trading.broker import BrokerError
 from quant_intelligence.trading.reconciliation import BrokerReconciliation
 from quant_intelligence.trading.sessions import AlpacaMarketSessionProvider
 from quant_intelligence.trading.persistence import PersistenceConfigurationError, operational_repository
+from quant_intelligence.trading.operations import activity_view, soak_summary, status_view
 from quant_intelligence.trading.runtime import CriticalResetError, CriticalRiskResetService, RuntimeConfigurationError, ServiceAlreadyRunning, ServiceConfig, build_persistent_service
 
 def main() -> None:
@@ -56,9 +57,61 @@ def main() -> None:
     reset = sub.add_parser("alpaca-risk-reset", help="audited critical-risk reset; never submits an order")
     reset.add_argument("--reason", required=True)
     reset.add_argument("--operator", required=True)
+    status_cmd = sub.add_parser("trading-status", help="show read-only durable autonomous-trader status")
+    status_cmd.add_argument("--json", action="store_true", dest="as_json")
+    activity_cmd = sub.add_parser("trading-activity", help="show bounded read-only autonomous activity")
+    activity_cmd.add_argument("--limit", type=int, default=25)
+    activity_cmd.add_argument("--json", action="store_true", dest="as_json")
+    summary_cmd = sub.add_parser("trading-soak-summary", help="summarize bounded read-only soak evidence")
+    summary_cmd.add_argument("--since", help="inclusive UTC ISO timestamp")
+    summary_cmd.add_argument("--until", help="inclusive UTC ISO timestamp")
+    summary_cmd.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if args.command == "backtest":
+    if args.command in {"trading-status", "trading-activity", "trading-soak-summary"}:
+        repository = None
+        try:
+            audit_dir = Path(os.getenv("QI_AUDIT_DIR", "alpaca_audit"))
+            repository = operational_repository(audit_dir, database_url=os.getenv("DATABASE_URL"), mode=os.getenv("QI_TRADING_PERSISTENCE", "postgres"))
+            if args.command == "trading-status":
+                report = status_view(repository, configured_symbols=tuple(filter(None, (os.getenv("QI_SYMBOL", "").strip().upper(),))))
+            elif args.command == "trading-activity":
+                if args.limit < 1 or args.limit > 500:
+                    parser.error("--limit must be between 1 and 500")
+                report = activity_view(repository, args.limit)
+            else:
+                def parse_bound(value: str | None) -> datetime | None:
+                    if not value:
+                        return None
+                    try:
+                        parsed = datetime.fromisoformat(value)
+                    except ValueError as exc:
+                        parser.error(f"invalid timestamp: {value}")
+                        raise AssertionError from exc
+                    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+                report = soak_summary(repository, since=parse_bound(args.since), until=parse_bound(args.until))
+            if getattr(args, "as_json", False):
+                print(json.dumps(report, indent=2, default=str))
+            elif args.command == "trading-status":
+                print("QUANT INTELLIGENCE TRADING STATUS")
+                for key, value in report.items():
+                    if key not in {"positions", "unresolved_orders"}:
+                        print(f"{key.replace('_', ' ').title()}: {value}")
+                if report["positions"]:
+                    print("Positions:")
+                    for position in report["positions"]:
+                        print(f"  {position['symbol']}: {position['quantity']} @ {position['average_price']}")
+                else:
+                    print("Positions: none observed")
+            else:
+                for key, value in report.items():
+                    print(f"{key.replace('_', ' ').title()}: {value}")
+        except (PersistenceConfigurationError, OSError, RuntimeError) as exc:
+            parser.error(f"read-only operational inspection unavailable: {exc}")
+        finally:
+            if repository is not None and hasattr(repository, "close"):
+                repository.close()
+    elif args.command == "backtest":
         spec = StrategySpec("sma-trend", args.symbol, date.fromisoformat(args.start) if args.start else None, date.fromisoformat(args.end) if args.end else None, args.initial_capital, signal_parameters={"window": args.window}, transaction_cost_bps=args.transaction_cost_bps)
         result = run_backtest(load_csv(args.data), spec, SmaTrendStrategy(args.window)); save_result(result, args.output, source_data=Path(args.data).read_bytes())
         summary = {key: result.metrics.get(key) for key in ("total_return", "cagr", "sharpe_ratio", "maximum_drawdown", "number_of_trades", "transaction_costs_paid")}

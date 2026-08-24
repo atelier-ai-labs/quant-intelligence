@@ -64,6 +64,11 @@ class OperationalRepository(Protocol):
     def load_risk_state(self, account_key: str = "default") -> RiskState | None: ...
     def evaluate_risk_state(self, **kwargs: Any) -> RiskEvaluation: ...
     def reset_critical_risk(self, **kwargs: Any) -> RiskEvaluation: ...
+    def list_orders(self, limit: int = 25) -> list[dict[str, Any]]: ...
+    def list_fills(self, limit: int = 25) -> list[dict[str, Any]]: ...
+    def list_reconciliations(self, limit: int = 25) -> list[dict[str, Any]]: ...
+    def list_risk_events(self, limit: int = 25) -> list[dict[str, Any]]: ...
+    def list_operational_events(self, limit: int = 25) -> list[dict[str, Any]]: ...
 
 
 class ServiceLock:
@@ -262,6 +267,23 @@ class RiskEventRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class OperationalEventRow(Base):
+    """Small append-only lifecycle journal; not a replacement for audit tables."""
+
+    __tablename__ = "operational_events"
+    __table_args__ = (UniqueConstraint("event_key", name="uq_operational_event_key"),)
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    event_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    service_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    trading_health: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    risk_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(2000), nullable=True)
+    event_payload: Mapped[dict[str, Any]] = mapped_column("metadata", JSON, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
@@ -369,6 +391,62 @@ class SqlAlchemyOperationalRepository:
                 fill = session.scalar(select(FillRow).where(FillRow.order_id == order.id).order_by(FillRow.filled_at.desc())) if order else None
                 decisions.append(_decision_from_row(row, order, fill))
             return decisions
+
+    def list_orders(self, limit: int | None = 25) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            query = select(OrderRow).order_by(OrderRow.updated_at.desc())
+            rows = session.scalars(query.limit(max(1, limit)) if limit is not None else query).all()
+            return [self._order_dict(row) for row in rows]
+
+    def list_fills(self, limit: int | None = 25) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            query = select(FillRow).order_by(FillRow.filled_at.desc())
+            rows = session.scalars(query.limit(max(1, limit)) if limit is not None else query).all()
+            return [self._fill_dict(row) for row in rows]
+
+    def list_reconciliations(self, limit: int | None = 25) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            query = select(ReconciliationRow).order_by(ReconciliationRow.reconciled_at.desc())
+            rows = session.scalars(query.limit(max(1, limit)) if limit is not None else query).all()
+            return [self._reconciliation_dict(row) for row in rows]
+
+    def list_risk_events(self, limit: int | None = 25) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            query = select(RiskEventRow).order_by(RiskEventRow.created_at.desc())
+            rows = session.scalars(query.limit(max(1, limit)) if limit is not None else query).all()
+            return [self._risk_event_dict(row) for row in rows]
+
+    def list_operational_events(self, limit: int = 25) -> list[dict[str, Any]]:
+        with Session(self.engine) as session:
+            rows = session.scalars(select(OperationalEventRow).order_by(OperationalEventRow.created_at.desc()).limit(max(1, limit))).all()
+            return [self._operational_event_dict(row) for row in rows]
+
+    @staticmethod
+    def _order_dict(row: OrderRow) -> dict[str, Any]:
+        return {"id": row.id, "cycle_id": row.cycle_id, "client_order_id": row.client_order_id, "broker_order_id": row.broker_order_id, "symbol": row.symbol, "side": row.side, "requested_quantity": row.requested_quantity, "submitted_quantity": row.submitted_quantity, "filled_quantity": row.filled_quantity, "average_fill_price": row.average_fill_price, "status": row.status, "submitted_at": row.submitted_at, "updated_at": row.updated_at}
+
+    @staticmethod
+    def _fill_dict(row: FillRow) -> dict[str, Any]:
+        return {"id": row.id, "order_id": row.order_id, "broker_fill_id": row.broker_fill_id, "quantity": row.quantity, "price": row.price, "transaction_cost": row.transaction_cost, "filled_at": row.filled_at}
+
+    @staticmethod
+    def _reconciliation_dict(row: ReconciliationRow) -> dict[str, Any]:
+        return {"id": row.id, "cycle_id": row.cycle_id, "order_id": row.order_id, "symbol": row.symbol, "expected_quantity": row.expected_quantity, "observed_quantity": row.observed_quantity, "expected_cash": row.expected_cash, "observed_cash": row.observed_cash, "status": row.status, "action_taken": row.action_taken, "reconciled_at": row.reconciled_at}
+
+    @staticmethod
+    def _risk_event_dict(row: RiskEventRow) -> dict[str, Any]:
+        return {"id": row.id, "event_key": row.event_key, "event_type": row.event_type, "session_id": row.session_id, "equity": row.equity, "reason": row.reason, "metadata": row.event_payload, "created_at": row.created_at}
+
+    @staticmethod
+    def _operational_event_dict(row: OperationalEventRow) -> dict[str, Any]:
+        return {"id": row.id, "event_key": row.event_key, "event_type": row.event_type, "service_state": row.service_state, "trading_health": row.trading_health, "risk_mode": row.risk_mode, "reason": row.reason, "metadata": row.event_payload, "created_at": row.created_at}
+
+    def record_operational_event(self, event_type: str, *, timestamp: datetime, event_key: str | None = None, service_state: str | None = None, trading_health: str | None = None, risk_mode: str | None = None, reason: str | None = None, metadata: dict[str, Any] | None = None) -> None:
+        with Session(self.engine) as session:
+            if event_key and session.scalar(select(OperationalEventRow.id).where(OperationalEventRow.event_key == event_key)) is not None:
+                return
+            session.add(OperationalEventRow(id=uuid4().hex, event_key=event_key, event_type=event_type, service_state=service_state, trading_health=trading_health, risk_mode=risk_mode, reason=reason, event_payload=metadata or {}, created_at=timestamp))
+            session.commit()
 
     def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]:
         terminal = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
@@ -636,6 +714,21 @@ class JsonOperationalRepository:
             if intent and intent.client_order_id:
                 candidates.append({"cycle_id": decision.cycle_id, "client_order_id": intent.client_order_id, "symbol": decision.symbol, "submitted_quantity": intent.quantity, "status": decision.outcome})
         return candidates
+
+    def list_orders(self, limit: int = 25) -> list[dict[str, Any]]:
+        return []
+
+    def list_fills(self, limit: int = 25) -> list[dict[str, Any]]:
+        return []
+
+    def list_reconciliations(self, limit: int = 25) -> list[dict[str, Any]]:
+        return []
+
+    def list_risk_events(self, limit: int = 25) -> list[dict[str, Any]]:
+        return []
+
+    def list_operational_events(self, limit: int = 25) -> list[dict[str, Any]]:
+        return []
 
 
 def operational_repository(audit_dir: str | Path, *, database_url: str | None = None, mode: str | None = None) -> OperationalRepository:

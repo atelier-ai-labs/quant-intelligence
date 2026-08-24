@@ -174,6 +174,72 @@ quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
 
 To roll back the latest schema revision, use `alembic downgrade -1`. The same `DATABASE_URL` format works with hosted PostgreSQL services such as Neon; no provider-specific API is required. The initial migration creates `trading_cycles`, `orders`, `fills`, `reconciliations`, `managed_positions`, and `operational_status`. Research/backtest result JSON remains file-based.
 
+## Forward-paper soak and operational proving v0.8
+
+v0.8 adds read-only operator views and a small append-only lifecycle journal. It
+does not add strategy logic, execution controls, or a second audit store.
+
+After applying migrations (`alembic upgrade head`), inspect durable state without
+contacting Alpaca or submitting an order:
+
+```bash
+quant-intelligence trading-status --json
+quant-intelligence trading-activity --limit 25
+quant-intelligence trading-soak-summary --json
+```
+
+These commands distinguish unknown and halted state from healthy state. They
+read PostgreSQL only; they never reconcile, reset risk, schedule work, or place
+orders. Use `--since` and `--until` with inclusive UTC ISO timestamps to bound a
+soak report. The `operational_events` table records startup, persistence,
+advisory-lock, reconciliation-readiness, shutdown, and fatal-service evidence;
+cycles, orders, fills, reconciliations, and risk events remain authoritative in
+their existing tables.
+
+### Controlled WSL PAPER soak runbook
+
+Preflight in the project environment:
+
+```bash
+set -a; . /path/to/protected/quant-intelligence.env; set +a
+alembic upgrade head
+test "$APCA_PAPER" = true
+test "$APCA_EXECUTION_ENABLED" = true
+quant-intelligence trading-status --json
+quant-intelligence alpaca-run --symbol "$QI_SYMBOL" --window "$QI_SMA_WINDOW" --dry-run-once
+```
+
+Start the supervised PAPER service in the foreground for the first run:
+
+```bash
+quant-intelligence alpaca-service
+```
+
+Observe it with `quant-intelligence trading-status`,
+`quant-intelligence trading-activity --limit 25`, and
+`quant-intelligence trading-soak-summary --since 2026-01-01T00:00:00+00:00`.
+For systemd, use `systemctl status quant-intelligence` and
+`journalctl -u quant-intelligence -f`.
+
+For a deliberate restart test, send SIGTERM (Ctrl+C in the foreground, or
+`sudo systemctl restart quant-intelligence`), wait for the old process to stop,
+then confirm a new startup, lock acquisition, startup reconciliation, and no
+second cycle/order for the already completed market session. Never use a bypass
+flag to recover from a halt.
+
+If health becomes `UNKNOWN`, a daily or critical halt appears, reconciliation is
+unresolved, PostgreSQL is unavailable, or the advisory lock is unavailable, stop
+treating the soak as healthy. Preserve the evidence and inspect the broker and
+database independently; do not force orders. Use the audited risk-reset command
+only for an eligible critical halt after reconciliation.
+
+The empirical soak is successful only after multiple completed sessions show no
+duplicate decision/order, clean restart and lock behavior, durable risk state
+across restart, explainable reconciliation/risk events, and complete
+decision-to-broker traceability. Profitability is not an acceptance criterion.
+Windows sleep, shutdown, or WSL termination stops the runtime; the application
+contains no WSL-specific trading logic.
+
 ## Persistent supervised paper service v0.6
 
 `alpaca-service` is the production-oriented, non-interactive entrypoint. It constructs the same `AutonomousTrader`, strategy, risk gate, reconciliation service, and Alpaca PAPER adapters used by `alpaca-run`. Startup validates configuration, checks PostgreSQL, acquires a PostgreSQL advisory lock, starts operational status, and reconciles Alpaca before any strategy cycle. The service checks persistence again before each strategy-triggering cycle and fails closed if durable state cannot be trusted.
