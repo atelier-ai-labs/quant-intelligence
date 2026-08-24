@@ -45,8 +45,15 @@ class BrokerReconciliation:
             result = ReconciliationResult(cycle_id, symbol, client_order_id, "MISSING", expected_quantity, 0, expected_position, observed_position, None, now, "ambiguous order was not found; stale intent will not be replayed")
         else:
             filled = order.filled_quantity
-            mismatch = (expected_position is not None and expected_position != observed_position) or (filled not in {0, expected_quantity})
-            result = ReconciliationResult(cycle_id, symbol, client_order_id, "MISMATCH" if mismatch else order.status, expected_quantity, filled, expected_position, observed_position, order.broker_order_id, now, None)
+            terminal = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+            mismatch = (expected_position is not None and expected_position != observed_position) or (order.status == "FILLED" and filled != expected_quantity)
+            if order.status not in terminal:
+                status = "UNRESOLVED"
+                error = f"broker order remains {order.status}"
+            else:
+                status = "MISMATCH" if mismatch else order.status
+                error = None
+            result = ReconciliationResult(cycle_id, symbol, client_order_id, status, expected_quantity, filled, expected_position, observed_position, order.broker_order_id, now, error)
         self._save(result)
         if hasattr(self.broker, "clear_unresolved_symbol") and result.status in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "MISSING", "MISMATCH"}:
             self.broker.clear_unresolved_symbol(symbol)
@@ -55,8 +62,18 @@ class BrokerReconciliation:
     def reconcile_pending(self, symbol: str | None = None) -> list[ReconciliationResult]:
         """Reconcile persisted external orders without evaluating strategy."""
         metadata = getattr(self.broker, "order_metadata", {})
-        results: list[ReconciliationResult] = []
+        candidates: dict[str, dict[str, Any]] = {}
+        if self.repository is not None and hasattr(self.repository, "pending_reconciliations"):
+            for item in self.repository.pending_reconciliations(symbol):
+                client_id = item.get("client_order_id")
+                if client_id:
+                    candidates[client_id] = item
         for item in metadata.values():
+            client_id = item.get("client_order_id")
+            if client_id:
+                candidates[client_id] = {**candidates.get(client_id, {}), **item}
+        results: list[ReconciliationResult] = []
+        for item in candidates.values():
             client_order_id = item.get("client_order_id")
             item_symbol = item.get("symbol")
             if not client_order_id or (symbol and item_symbol != symbol):

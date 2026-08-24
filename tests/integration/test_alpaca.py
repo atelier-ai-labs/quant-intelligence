@@ -216,3 +216,30 @@ def test_reconciliation_preserves_position_mismatch(tmp_path):
     assert result.status == "MISMATCH"
     payload = (tmp_path / "reconciliation-cycle-mismatch.json").read_text(encoding="utf-8")
     assert '"expected_position": 1' in payload and '"observed_position": 0' in payload
+
+
+@pytest.mark.parametrize("remote_state", ["new", "partially_filled"])
+def test_durable_pending_order_blocks_until_terminal_without_local_metadata(tmp_path, remote_state):
+    class DurableRepository:
+        def pending_reconciliations(self, symbol=None):
+            return [{"cycle_id": "cycle-durable", "client_order_id": "qi-durable", "symbol": "SYNTH", "submitted_quantity": 2, "status": "PENDING_SUBMISSION"}]
+
+        def save_reconciliation(self, result):
+            self.result = result
+
+    filled = "1" if remote_state == "partially_filled" else "0"
+    client = FakeTradingClient(remote_order(remote_state, filled, "10" if filled == "1" else None))
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    repository = DurableRepository()
+    results = BrokerReconciliation(broker, tmp_path, repository=repository).reconcile_pending("SYNTH")
+    assert len(results) == 1
+    assert results[0].status == "UNRESOLVED"
+    assert results[0].client_order_id == "qi-durable"
+
+
+def test_preflight_blocks_recognized_open_order(tmp_path):
+    client = FakeTradingClient(remote_order("new"))
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=tmp_path / "orders.json")
+    broker.order_metadata["qi-open"] = {"cycle_id": "cycle-open", "client_order_id": "qi-open", "symbol": "SYNTH", "submitted_quantity": 1, "status": "SUBMITTED"}
+    with pytest.raises(BrokerError, match="unresolved Alpaca state"):
+        broker.preflight("SYNTH")

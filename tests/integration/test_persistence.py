@@ -85,6 +85,16 @@ def test_status_round_trip_and_postgres_mode_requires_url(tmp_path, monkeypatch)
         operational_repository(tmp_path / "audit")
 
 
+def test_pending_submission_is_discoverable_without_order_row(tmp_path):
+    repository = repo(tmp_path)
+    timestamp = datetime(2024, 1, 2, tzinfo=timezone.utc)
+    intent = {"symbol": "SPY", "side": "BUY", "quantity": 1, "order_type": "MARKET", "asset_type": "EQUITY", "reason": "test", "client_order_id": "qi-pending", "cycle_id": "cycle-pending"}
+    with Session(repository.engine) as session:
+        session.add(TradingCycleRow(id="cycle-pending", strategy_name="sma_trend", strategy_version="1", symbol="SPY", market_session=timestamp.isoformat(), mode="paper_execution", signal="BUY", outcome="PENDING_SUBMISSION", created_at=timestamp, updated_at=timestamp, strategy_parameters={}, signal_reason="test", risk_approved=True, risk_reason="approved", proposed_order=intent, execution_order=intent))
+        session.commit()
+    assert repository.pending_reconciliations("SPY") == [{"cycle_id": "cycle-pending", "client_order_id": "qi-pending", "symbol": "SPY", "submitted_quantity": 1, "status": "PENDING_SUBMISSION"}]
+
+
 def test_persistence_failure_prevents_external_order_submission():
     class FailingRepository:
         def get(self, cycle_id):

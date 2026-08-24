@@ -174,6 +174,49 @@ quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
 
 To roll back the latest schema revision, use `alembic downgrade -1`. The same `DATABASE_URL` format works with hosted PostgreSQL services such as Neon; no provider-specific API is required. The initial migration creates `trading_cycles`, `orders`, `fills`, `reconciliations`, `managed_positions`, and `operational_status`. Research/backtest result JSON remains file-based.
 
+## Persistent supervised paper service v0.6
+
+`alpaca-service` is the production-oriented, non-interactive entrypoint. It constructs the same `AutonomousTrader`, strategy, risk gate, reconciliation service, and Alpaca PAPER adapters used by `alpaca-run`. Startup validates configuration, checks PostgreSQL, acquires a PostgreSQL advisory lock, starts operational status, and reconciles Alpaca before any strategy cycle. The service checks persistence again before each strategy-triggering cycle and fails closed if durable state cannot be trusted.
+
+Copy `.env.example` to a protected environment file and supply real values outside Git. Required production settings are `QI_TRADING_PERSISTENCE=postgres`, `DATABASE_URL`, `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `APCA_PAPER=true`, and an explicitly reviewed `APCA_EXECUTION_ENABLED=true`. Safe runtime settings include `QI_SYMBOL`, `QI_SMA_WINDOW`, the three risk caps, the post-close delay, and the reconciliation interval. Configuration errors never print credentials or the database URL.
+
+Run manually in the foreground first:
+
+```bash
+set -a
+. /path/to/protected/quant-intelligence.env
+set +a
+quant-intelligence alpaca-service
+```
+
+For a no-order connectivity and scheduling check, retain the existing debugging command:
+
+```bash
+quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
+```
+
+The deployment template is `deploy/quant-intelligence.service`. Install the Python package or virtual environment so `quant-intelligence` is on the service `PATH`, place the protected environment file at `/etc/quant-intelligence/quant-intelligence.env`, then install and manage the unit explicitly:
+
+```bash
+sudo useradd --system --home-dir /var/lib/quant-intelligence --shell /usr/sbin/nologin quant-intelligence
+sudo install -d -m 0750 /etc/quant-intelligence
+sudo install -m 0600 /path/to/protected/quant-intelligence.env /etc/quant-intelligence/quant-intelligence.env
+sudo install -m 0644 deploy/quant-intelligence.service /etc/systemd/system/quant-intelligence.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now quant-intelligence.service
+sudo systemctl status quant-intelligence.service
+sudo journalctl -u quant-intelligence.service -f
+sudo systemctl restart quant-intelligence.service
+sudo systemctl stop quant-intelligence.service
+sudo systemctl disable quant-intelligence.service
+```
+
+The unit runs as the unprivileged `quant-intelligence` service account, asks systemd to manage `/var/lib/quant-intelligence`, sends SIGTERM for graceful shutdown, records stdout/stderr in the journal, and restarts only after unexpected failure with a 30-second delay and a bounded start rate. It deliberately does not embed credentials, a personal username, repository path, or WSL behavior. Keep `QI_AUDIT_DIR=/var/lib/quant-intelligence/alpaca_audit` for this unit. If a virtual environment is not globally discoverable, set a safe `PATH` in the protected environment file or adapt `ExecStart` during deployment.
+
+The single-instance guard is a PostgreSQL session advisory lock, so it coordinates processes across WSL, Linux hosts, and containers that share the same database and lock name. The lock is released when its dedicated database connection closes; it is not a scheduler or leader-election system, and a future multi-account/distributed design will need explicit leases and fencing. Database and reconciliation failures distinguish a living process from halted trading.
+
+On WSL, systemd must be enabled by the host distribution. Windows sleep, restart, shutdown, or termination of the WSL VM stops the Linux service; systemd can restart it only after WSL itself resumes or starts. The application contains no WSL-specific trading logic and the same entrypoint/unit semantics are portable to a normal Linux host or a future container process supervisor.
+
 ## Assumptions and methodology
 
 Signals for day `t` use only bars before day `t`; a 200-day SMA is calculated from closes through `t-1`, and changes execute at day `t` open. Buys use the maximum whole-share quantity affordable after the configured cost; fractional shares are disabled. Costs equal traded notional × bps / 10,000. The benchmark buys whole shares at the first selected bar's open, applies the same cost model, holds through the final close, and leaves residual cash idle.

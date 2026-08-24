@@ -57,6 +57,10 @@ class AutonomousTrader:
         """Run broker reconciliation without evaluating the strategy."""
         return self._preflight()
 
+    def halt(self, reason: str) -> None:
+        """Public fail-closed lifecycle boundary for process supervisors."""
+        self._halt(reason)
+
     def _run_session_cycle(self, current: datetime) -> list[TradingDecision]:
         try:
             session = self.session_provider.latest_completed_session(current, self.post_close_delay)  # type: ignore[union-attr]
@@ -68,9 +72,9 @@ class AutonomousTrader:
             self._persist_status()
             return []
         session_key = session.session_date.isoformat()
-        if self.status.latest_completed_session == session_key:
-            return []
         if not self._preflight():
+            return []
+        if self.status.latest_completed_session == session_key:
             return []
         logger.info("scheduler_trigger", extra={"symbol": self.symbol, "session": session_key})
         logger.info("cycle_started", extra={"symbol": self.symbol, "session": session_key})
@@ -128,7 +132,7 @@ class AutonomousTrader:
             return True
         if self.reconciliation_service is not None:
             results = self.reconciliation_service.reconcile_pending(self.symbol)
-            if any(result.status in {"UNKNOWN", "MISMATCH", "MISSING"} for result in results):
+            if any(result.status in {"UNKNOWN", "UNRESOLVED", "MISMATCH", "MISSING"} for result in results):
                 self._halt("broker reconciliation requires attention")
                 return False
         try:

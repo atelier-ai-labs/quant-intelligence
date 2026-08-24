@@ -1,0 +1,27 @@
+[Unit]
+Description=Atelier AI Quant Intelligence autonomous paper trader
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=quant-intelligence
+Group=quant-intelligence
+StateDirectory=quant-intelligence
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/quant-intelligence
+Environment=QI_AUDIT_DIR=/var/lib/quant-intelligence/alpaca_audit
+EnvironmentFile=/etc/quant-intelligence/quant-intelligence.env
+ExecStart=/usr/bin/env quant-intelligence alpaca-service
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=60
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

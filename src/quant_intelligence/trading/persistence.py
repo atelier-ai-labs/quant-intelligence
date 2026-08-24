@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 from dataclasses import asdict
 from datetime import datetime
 from enum import StrEnum
@@ -28,6 +29,7 @@ from sqlalchemy import (
     delete,
     event,
     select,
+    text,
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
@@ -56,6 +58,42 @@ class OperationalRepository(Protocol):
     def save(self, decision: TradingDecision) -> None: ...
     def load_status(self) -> OperationalStatus: ...
     def save_status(self, status: OperationalStatus) -> None: ...
+    def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]: ...
+
+
+class ServiceLock:
+    """Connection-scoped PostgreSQL advisory lock held for a service lifetime."""
+
+    def __init__(self, connection: Any, lock_id: int, backend_pid: int):
+        self._connection = connection
+        self._lock_id = lock_id
+        self._backend_pid = backend_pid
+        unsigned = lock_id & ((1 << 64) - 1)
+        self._class_id = unsigned >> 32
+        self._object_id = unsigned & 0xFFFFFFFF
+        self._released = False
+
+    def ensure_held(self) -> None:
+        if self._released:
+            raise RuntimeError("service lock has been released")
+        backend_pid = self._connection.execute(text("SELECT pg_backend_pid()")).scalar_one()
+        if backend_pid != self._backend_pid:
+            raise RuntimeError("service lock connection changed")
+        held = self._connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND classid = :class_id AND objid = :object_id AND objsubid = 1 AND granted)"),
+            {"class_id": self._class_id, "object_id": self._object_id},
+        ).scalar_one()
+        if not held:
+            raise RuntimeError("service advisory lock is no longer held")
+
+    def release(self) -> None:
+        if self._released:
+            return
+        try:
+            self._connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": self._lock_id})
+        finally:
+            self._connection.close()
+            self._released = True
 
 
 class Base(DeclarativeBase):
@@ -249,6 +287,26 @@ class SqlAlchemyOperationalRepository:
         with self.engine.connect() as connection:
             connection.exec_driver_sql("SELECT 1")
 
+    def acquire_service_lock(self, name: str) -> ServiceLock | None:
+        if self.engine.dialect.name != "postgresql":
+            raise PersistenceConfigurationError("persistent service locking requires PostgreSQL")
+        raw = int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big", signed=False)
+        lock_id = raw if raw < 2**63 else raw - 2**64
+        connection = self.engine.connect()
+        try:
+            backend_pid = connection.execute(text("SELECT pg_backend_pid()")).scalar_one()
+            acquired = connection.execute(text("SELECT pg_try_advisory_lock(:lock_id)"), {"lock_id": lock_id}).scalar_one()
+        except Exception:
+            connection.close()
+            raise
+        if not acquired:
+            connection.close()
+            return None
+        return ServiceLock(connection, lock_id, backend_pid)
+
+    def close(self) -> None:
+        self.engine.dispose()
+
     def get(self, cycle_id: str) -> TradingDecision | None:
         with Session(self.engine) as session:
             row = session.get(TradingCycleRow, cycle_id)
@@ -267,6 +325,37 @@ class SqlAlchemyOperationalRepository:
                 fill = session.scalar(select(FillRow).where(FillRow.order_id == order.id).order_by(FillRow.filled_at.desc())) if order else None
                 decisions.append(_decision_from_row(row, order, fill))
             return decisions
+
+    def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        terminal = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+        candidates: dict[str, dict[str, Any]] = {}
+        with Session(self.engine) as session:
+            order_query = select(OrderRow).where(OrderRow.status.notin_(terminal))
+            if symbol:
+                order_query = order_query.where(OrderRow.symbol == symbol)
+            for order in session.scalars(order_query).all():
+                candidates[order.client_order_id] = {
+                    "cycle_id": order.cycle_id,
+                    "client_order_id": order.client_order_id,
+                    "symbol": order.symbol,
+                    "submitted_quantity": order.submitted_quantity,
+                    "status": order.status,
+                }
+            cycle_query = select(TradingCycleRow).where(TradingCycleRow.outcome.in_(("PENDING_SUBMISSION", "UNKNOWN")))
+            if symbol:
+                cycle_query = cycle_query.where(TradingCycleRow.symbol == symbol)
+            for cycle in session.scalars(cycle_query).all():
+                intent = cycle.execution_order or cycle.proposed_order or {}
+                client_id = intent.get("client_order_id")
+                if client_id:
+                    candidates.setdefault(client_id, {
+                        "cycle_id": cycle.id,
+                        "client_order_id": client_id,
+                        "symbol": cycle.symbol,
+                        "submitted_quantity": int(intent.get("quantity", 0) or 0),
+                        "status": cycle.outcome,
+                    })
+        return list(candidates.values())
 
     def _save_decision_impl(self, decision: TradingDecision) -> None:
         now = decision.timestamp
@@ -393,6 +482,16 @@ class JsonOperationalRepository:
         path = self.audit.root / "reconciliations"
         path.mkdir(parents=True, exist_ok=True)
         (path / f"{result.cycle_id}-{result.last_reconciled_at.timestamp()}.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]:
+        candidates = []
+        for decision in self.list():
+            if decision.outcome not in {"PENDING_SUBMISSION", "UNKNOWN"} or (symbol and decision.symbol != symbol):
+                continue
+            intent = decision.execution_order or decision.proposed_order
+            if intent and intent.client_order_id:
+                candidates.append({"cycle_id": decision.cycle_id, "client_order_id": intent.client_order_id, "symbol": decision.symbol, "submitted_quantity": intent.quantity, "status": decision.outcome})
+        return candidates
 
 
 def operational_repository(audit_dir: str | Path, *, database_url: str | None = None, mode: str | None = None) -> OperationalRepository:

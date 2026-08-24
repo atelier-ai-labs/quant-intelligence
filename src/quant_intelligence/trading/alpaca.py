@@ -303,7 +303,9 @@ class AlpacaBroker:
             metadata["broker_order_id"] = remote.broker_order_id
             metadata["filled_quantity"] = remote.filled_quantity
             metadata["average_fill_price"] = remote.average_fill_price
-            if remote.status not in {"SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED", "UNKNOWN"}:
+            if remote.status in {"SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED", "UNKNOWN"}:
+                self.unresolved_symbols.add(str(metadata.get("symbol", symbol)))
+            else:
                 self.unresolved_symbols.discard(str(metadata.get("symbol", symbol)))
         self._save_metadata()
         if symbol in self.unresolved_symbols:

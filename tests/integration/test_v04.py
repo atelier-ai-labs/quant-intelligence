@@ -43,10 +43,19 @@ def test_alpaca_calendar_uses_supported_request_boundary():
 
 
 def test_session_runner_executes_once_and_restart_is_idempotent(tmp_path):
+    class PreflightPaperBroker(PaperBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.preflight_calls = 0
+
+        def preflight(self, symbol):
+            self.preflight_calls += 1
+            return self.cash, self.get_positions()
+
     current = datetime(2024, 7, 3, 19, tzinfo=UTC)
     clock = FakeClock(current)
     provider = FixtureMarketDataProvider("SYNTH", bars([10, 11, 12]), data_timestamp=datetime(2024, 7, 3, tzinfo=UTC), max_age=timedelta(days=2))
-    broker = PaperBroker(1000, transaction_cost_bps=0, state_path=tmp_path / "broker.json")
+    broker = PreflightPaperBroker(1000, transaction_cost_bps=0, state_path=tmp_path / "broker.json")
     service = TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=provider, risk_gate=RiskGate(RiskConfig(max_order_notional=1000), transaction_cost_bps=0), audit_store=TradingAuditStore(tmp_path / "audit"))
     calendar = FixtureMarketSessionProvider((session(date(2024, 7, 3), 13),))
     first = AutonomousTrader(symbol="SYNTH", cycle_service=service, clock=clock, status_store=StatusStore(tmp_path / "status.json"), session_provider=calendar, post_close_delay=timedelta(minutes=5))
@@ -58,6 +67,8 @@ def test_session_runner_executes_once_and_restart_is_idempotent(tmp_path):
     restarted.start()
     assert restarted.run_due_cycles() == []
     assert len(broker.orders) == 1
+    assert broker.preflight_calls == 2
+    assert restarted.status.trading_health == "healthy"
 
 
 def test_unmanaged_position_is_preserved(tmp_path):

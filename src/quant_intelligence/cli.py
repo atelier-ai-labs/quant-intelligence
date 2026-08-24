@@ -1,7 +1,9 @@
 import argparse
 import json
 import logging
+import signal
 import time
+from threading import Event
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +21,7 @@ from quant_intelligence.trading.broker import BrokerError
 from quant_intelligence.trading.reconciliation import BrokerReconciliation
 from quant_intelligence.trading.sessions import AlpacaMarketSessionProvider
 from quant_intelligence.trading.persistence import operational_repository
+from quant_intelligence.trading.runtime import RuntimeConfigurationError, ServiceAlreadyRunning, ServiceConfig, build_persistent_service
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="quant-intelligence")
@@ -48,6 +51,7 @@ def main() -> None:
     ar.add_argument("--post-close-delay-minutes", type=float, default=5.0); ar.add_argument("--max-position-allocation", type=float, default=0.25)
     ar.add_argument("--max-order-notional", type=float, default=2500.0); ar.add_argument("--max-order-shares", type=int, default=10)
     ar.add_argument("--dry-run-once", action="store_true", help="reconcile and show the next/current decision without submitting")
+    sub.add_parser("alpaca-service", help="run the environment-configured supervised Alpaca paper trader")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.command == "backtest":
@@ -172,3 +176,29 @@ def main() -> None:
             logging.getLogger(__name__).info("shutdown_requested")
         finally:
             trader.stop()
+    elif args.command == "alpaca-service":
+        try:
+            service_config = ServiceConfig.from_env()
+            stop_event = Event()
+            runtime = build_persistent_service(service_config, stop_event=stop_event)
+        except RuntimeConfigurationError as exc:
+            parser.error(str(exc))
+
+        def request_shutdown(signum, _frame):
+            logging.getLogger(__name__).info("termination_signal_received", extra={"signal": signum})
+            runtime.request_stop()
+
+        previous = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+        for sig in previous:
+            signal.signal(sig, request_shutdown)
+        try:
+            runtime.run()
+        except ServiceAlreadyRunning as exc:
+            logging.getLogger(__name__).error("service_instance_refused", extra={"reason": str(exc)})
+            raise SystemExit(1) from exc
+        except Exception as exc:
+            logging.getLogger(__name__).critical("service_exited_fatally", extra={"error_type": type(exc).__name__})
+            raise SystemExit(1) from exc
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
