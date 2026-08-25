@@ -80,7 +80,7 @@ class AutonomousTrader:
         logger.info("scheduler_trigger", extra={"symbol": self.symbol, "session": session_key})
         logger.info("cycle_started", extra={"symbol": self.symbol, "session": session_key})
         try:
-            decision = self.cycle_service.run(self.symbol, now=current, reconciled=True, session_id=session_key)
+            decision = self.cycle_service.run(self.symbol, now=current, reconciled=True, session_id=session_key, completed_session=session, post_close_delay=self.post_close_delay)
         except Exception as exc:
             self.status.last_error = str(exc)
             self.status.last_cycle_outcome = "FAILED"
@@ -88,7 +88,9 @@ class AutonomousTrader:
             logger.exception("cycle_failed", extra={"symbol": self.symbol})
             self.stop()
             return []
-        if decision.risk_decision.reason != "stale market data":
+        retryable_data_failure = decision.error in {"stale market data", "invalid completed market session"} or (decision.error or "").startswith("market data unavailable:")
+        data_matches_session = decision.data_timestamp is not None and decision.data_timestamp.date().isoformat() == session_key
+        if data_matches_session and not retryable_data_failure:
             self.status.latest_completed_session = session_key
         self.status.next_scheduled_decision = self.next_decision_time(current)
         self.status.update_from_decision(decision)

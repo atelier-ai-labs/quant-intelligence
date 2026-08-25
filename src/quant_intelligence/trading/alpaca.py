@@ -17,6 +17,7 @@ from quant_intelligence.models import Bar
 from .broker import BrokerError, BrokerSubmissionUnknown, BrokerUnavailable, ExecutionDisabled
 from .market import MarketDataSnapshot, MarketDataUnavailable
 from .models import Fill, Order, OrderIntent, PortfolioSnapshot, Position, SignalAction
+from .sessions import MarketSession
 
 
 class AlpacaConfigurationError(RuntimeError):
@@ -129,11 +130,19 @@ class AlpacaMarketDataProvider:
         except ImportError as exc:
             raise AlpacaConfigurationError("alpaca-py is required for Alpaca market data") from exc
 
-    def get_completed_bars(self, symbol: str, now: datetime) -> MarketDataSnapshot:
+    def get_completed_bars(self, symbol: str, now: datetime, *, completed_session: MarketSession | None = None, post_close_delay: timedelta = timedelta()) -> MarketDataSnapshot:
         if symbol != self.symbol:
             raise MarketDataUnavailable(f"provider is configured for {self.symbol}")
         current = now.astimezone(timezone.utc)
-        end = datetime.combine(current.date(), time.min, tzinfo=timezone.utc)
+        if completed_session is not None:
+            available_at = completed_session.closes_at + post_close_delay
+            if current < available_at:
+                raise MarketDataUnavailable("completed market session is not yet past its safety delay")
+            boundary_date = completed_session.session_date
+            end = datetime.combine(boundary_date + timedelta(days=1), time.min, tzinfo=timezone.utc)
+        else:
+            boundary_date = current.date() - timedelta(days=1)
+            end = datetime.combine(current.date(), time.min, tzinfo=timezone.utc)
         start = end - timedelta(days=max(self.window * 4, self.window + 14))
         try:
             response = self.client.get_stock_bars(self._request(start, end))
@@ -152,7 +161,7 @@ class AlpacaMarketDataProvider:
             else:
                 parsed = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
                 bar_date = parsed.astimezone(timezone.utc).date() if parsed.tzinfo else parsed.date()
-            if bar_date >= current.date():
+            if bar_date > boundary_date:
                 continue
             try:
                 bars.append(Bar(bar_date, float(_value(item, "open")), float(_value(item, "high")), float(_value(item, "low")), float(_value(item, "close")), float(_value(item, "volume"))))

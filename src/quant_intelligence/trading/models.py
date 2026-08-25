@@ -97,3 +97,5 @@ class TradingDecision:
     error: str | None = None
     execution_order: OrderIntent | None = None
     reconciliation: dict[str, Any] | None = None
+    market_session: str | None = None
+    execution_mode: str | None = None

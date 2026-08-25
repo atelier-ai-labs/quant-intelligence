@@ -17,7 +17,7 @@ class MarketDataSnapshot:
         return self.bars[-1].close
 
 class MarketDataProvider(Protocol):
-    def get_completed_bars(self, symbol: str, now: datetime) -> MarketDataSnapshot: ...
+    def get_completed_bars(self, symbol: str, now: datetime, *, completed_session: object | None = None, post_close_delay: timedelta = timedelta()) -> MarketDataSnapshot: ...
     def is_fresh(self, snapshot: MarketDataSnapshot, now: datetime) -> bool: ...
 
 class MarketDataUnavailable(RuntimeError):
@@ -31,7 +31,7 @@ class FixtureMarketDataProvider:
         self.unavailable = unavailable
         self.max_age = max_age
 
-    def get_completed_bars(self, symbol: str, now: datetime) -> MarketDataSnapshot:
+    def get_completed_bars(self, symbol: str, now: datetime, *, completed_session: object | None = None, post_close_delay: timedelta = timedelta()) -> MarketDataSnapshot:
         if self.unavailable or symbol != self.symbol: raise MarketDataUnavailable("market data unavailable")
         return MarketDataSnapshot(symbol, self.bars, self.data_timestamp, now)
 
@@ -48,7 +48,7 @@ class SequencedFixtureMarketDataProvider(FixtureMarketDataProvider):
         if not 0 < count <= len(self.bars): raise ValueError("available bar count is out of range")
         self.available_count = count
 
-    def get_completed_bars(self, symbol: str, now: datetime) -> MarketDataSnapshot:
+    def get_completed_bars(self, symbol: str, now: datetime, *, completed_session: object | None = None, post_close_delay: timedelta = timedelta()) -> MarketDataSnapshot:
         if self.available_count == 0: raise MarketDataUnavailable("no completed bars available")
         visible = self.bars[:self.available_count]
         timestamp = datetime.combine(visible[-1].date, datetime.min.time(), tzinfo=timezone.utc)

@@ -119,6 +119,7 @@ class TradingCycleRow(Base):
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     market_session: Mapped[str] = mapped_column(String(64), nullable=False)
+    market_data_timestamp: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     mode: Mapped[str] = mapped_column(String(64), nullable=False)
     signal: Mapped[str] = mapped_column(String(16), nullable=False)
     outcome: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -329,7 +330,8 @@ def _decision_from_row(row: TradingCycleRow, order_row: OrderRow | None, fill_ro
         fill = Fill(fill_row.order_id, order_row.symbol if order_row else row.symbol, side, fill_row.quantity, fill_row.price, fill_row.quantity * fill_row.price, fill_row.transaction_cost, fill_row.filled_at)
     risk_intent = _intent_from_json(row.execution_order or row.proposed_order)
     risk = RiskDecision(row.risk_approved, row.risk_reason, risk_intent, row.risk_mode, row.risk_event_type)
-    return TradingDecision(row.id, row.created_at, row.symbol, row.strategy_name, row.strategy_parameters or {}, datetime.fromisoformat(row.market_session) if row.market_session else None, SignalAction(row.signal), row.signal_reason, _snapshot_from_json(row.portfolio_before), _intent_from_json(row.proposed_order), risk, order, fill, _snapshot_from_json(row.portfolio_after), row.outcome, row.error, _intent_from_json(row.execution_order), reconciliation or row.reconciliation_payload)
+    data_timestamp = row.market_data_timestamp or (datetime.fromisoformat(row.market_session) if row.market_session else None)
+    return TradingDecision(row.id, row.created_at, row.symbol, row.strategy_name, row.strategy_parameters or {}, data_timestamp, SignalAction(row.signal), row.signal_reason, _snapshot_from_json(row.portfolio_before), _intent_from_json(row.proposed_order), risk, order, fill, _snapshot_from_json(row.portfolio_after), row.outcome, row.error, _intent_from_json(row.execution_order), reconciliation or row.reconciliation_payload, row.market_session, row.mode)
 
 
 class SqlAlchemyOperationalRepository:
@@ -581,9 +583,10 @@ class SqlAlchemyOperationalRepository:
                 row = session.get(TradingCycleRow, decision.cycle_id)
                 if row is None:
                     mode = "observation" if decision.outcome.startswith("WOULD") else "paper_execution"
-                    row = TradingCycleRow(id=decision.cycle_id, strategy_name=decision.strategy, strategy_version=str(decision.strategy_parameters.get("version", "1")), symbol=decision.symbol, market_session=(decision.data_timestamp or decision.timestamp).isoformat(), mode=mode, signal=decision.signal.value, outcome=decision.outcome, created_at=now, updated_at=now)
+                    mode = decision.execution_mode or mode
+                    row = TradingCycleRow(id=decision.cycle_id, strategy_name=decision.strategy, strategy_version=str(decision.strategy_parameters.get("version", "1")), symbol=decision.symbol, market_session=decision.market_session or (decision.data_timestamp or decision.timestamp).date().isoformat(), market_data_timestamp=decision.data_timestamp, mode=mode, signal=decision.signal.value, outcome=decision.outcome, created_at=now, updated_at=now)
                     session.add(row)
-                row.signal = decision.signal.value; row.outcome = decision.outcome; row.updated_at = now; row.strategy_parameters = _json_value(decision.strategy_parameters); row.signal_reason = decision.signal_reason; row.risk_approved = decision.risk_decision.approved; row.risk_reason = decision.risk_decision.reason; row.risk_mode = decision.risk_decision.mode; row.risk_event_type = decision.risk_decision.event_type; row.error = decision.error; row.portfolio_before = _snapshot(decision.portfolio_before); row.portfolio_after = _snapshot(decision.portfolio_after); row.proposed_order = _intent(decision.proposed_order); row.execution_order = _intent(decision.execution_order); row.reconciliation_payload = _json_value(decision.reconciliation)
+                row.market_session = decision.market_session or row.market_session; row.market_data_timestamp = decision.data_timestamp; row.mode = decision.execution_mode or row.mode; row.signal = decision.signal.value; row.outcome = decision.outcome; row.updated_at = now; row.strategy_parameters = _json_value(decision.strategy_parameters); row.signal_reason = decision.signal_reason; row.risk_approved = decision.risk_decision.approved; row.risk_reason = decision.risk_decision.reason; row.risk_mode = decision.risk_decision.mode; row.risk_event_type = decision.risk_decision.event_type; row.error = decision.error; row.portfolio_before = _snapshot(decision.portfolio_before); row.portfolio_after = _snapshot(decision.portfolio_after); row.proposed_order = _intent(decision.proposed_order); row.execution_order = _intent(decision.execution_order); row.reconciliation_payload = _json_value(decision.reconciliation)
                 session.flush()
                 event_type = decision.risk_decision.event_type
                 if event_type and not decision.risk_decision.approved:
