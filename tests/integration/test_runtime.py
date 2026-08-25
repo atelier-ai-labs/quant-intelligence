@@ -14,7 +14,8 @@ from quant_intelligence.trading.runtime import (
 from quant_intelligence.trading.models import Position
 from quant_intelligence.trading.risk import RiskEvaluation, RiskMode, RiskState
 from quant_intelligence.trading.status import OperationalStatus
-from quant_intelligence.cli import main as cli_main
+from quant_intelligence.cli import _alpaca_operational_repository, main as cli_main
+from quant_intelligence.trading.persistence import PersistenceConfigurationError
 
 
 def valid_environment():
@@ -118,6 +119,61 @@ def test_service_configuration_accepts_safe_paper_runtime():
     assert config.window == 200
     assert config.max_position_allocation == 0.20
     assert config.max_gross_exposure == 1.0 and config.max_leverage == 1.0
+
+
+def test_alpaca_dry_run_honors_configured_postgres_persistence(monkeypatch, tmp_path):
+    selected = {}
+
+    def fake_repository(audit_dir, *, database_url, mode):
+        selected.update(audit_dir=audit_dir, database_url=database_url, mode=mode)
+        return object()
+
+    monkeypatch.setenv("QI_TRADING_PERSISTENCE", "postgres")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://example.invalid/qi")
+    monkeypatch.setattr("quant_intelligence.cli.operational_repository", fake_repository)
+
+    repository, mode = _alpaca_operational_repository(tmp_path, execution_enabled=False)
+
+    assert repository is not None
+    assert mode == "postgres"
+    assert selected["mode"] == "postgres"
+    assert selected["database_url"] == "postgresql+psycopg://example.invalid/qi"
+
+
+def test_alpaca_observation_can_use_json_only_when_explicitly_selected(monkeypatch, tmp_path):
+    selected = {}
+
+    def fake_repository(audit_dir, *, database_url, mode):
+        selected.update(audit_dir=audit_dir, database_url=database_url, mode=mode)
+        return object()
+
+    monkeypatch.setenv("QI_TRADING_PERSISTENCE", "json")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.setattr("quant_intelligence.cli.operational_repository", fake_repository)
+
+    repository, mode = _alpaca_operational_repository(tmp_path, execution_enabled=False)
+
+    assert repository is not None
+    assert mode == "json"
+    assert selected["mode"] == "json"
+    assert selected["database_url"] is None
+
+
+def test_alpaca_execution_rejects_explicit_json_persistence(monkeypatch, tmp_path):
+    monkeypatch.setenv("QI_TRADING_PERSISTENCE", "json")
+    with pytest.raises(PersistenceConfigurationError, match="requires QI_TRADING_PERSISTENCE=postgres"):
+        _alpaca_operational_repository(tmp_path, execution_enabled=True)
+
+
+def test_alpaca_postgres_failure_does_not_fall_back_to_json(monkeypatch, tmp_path):
+    monkeypatch.setenv("QI_TRADING_PERSISTENCE", "postgres")
+
+    def unavailable(*args, **kwargs):
+        raise PersistenceConfigurationError("DATABASE_URL is unavailable")
+
+    monkeypatch.setattr("quant_intelligence.cli.operational_repository", unavailable)
+    with pytest.raises(PersistenceConfigurationError, match="DATABASE_URL is unavailable"):
+        _alpaca_operational_repository(tmp_path, execution_enabled=False)
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from quant_intelligence.trading import AutonomousTrader, FakeClock, IntervalScheduler, PaperBroker, TradingCycleService
 from quant_intelligence.trading.audit import TradingAuditStore
@@ -65,3 +66,51 @@ def test_status_persists_across_restart(tmp_path):
     trader, _, _ = make_trader(tmp_path, provider=provider); trader.start(); decision = trader.run_due_cycles()[0]
     restored = StatusStore(tmp_path / "status.json").load()
     assert restored.last_cycle_id == decision.cycle_id; assert restored.current_positions[0].shares == 15; assert restored.current_equity == 1000
+
+
+def test_observation_does_not_consume_execution_session_marker(tmp_path):
+    session_date = datetime(2024, 1, 8, tzinfo=timezone.utc)
+
+    class Sessions:
+        def latest_completed_session(self, now, delay):
+            return SimpleNamespace(session_date=session_date.date())
+
+        def next_decision_time(self, now, delay):
+            return now
+
+    class Cycle:
+        def __init__(self, mode):
+            self.execution_mode = mode
+            self.calls = 0
+            self.broker = object()
+            self.audit_store = SimpleNamespace(list=lambda: [])
+
+        def run(self, symbol, **kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                cycle_id=f"{self.execution_mode}-{self.calls}", timestamp=session_date,
+                data_timestamp=session_date, outcome="HOLD", error=None,
+                risk_decision=SimpleNamespace(mode="NORMAL", reason="no order"),
+                signal="HOLD", submitted_order=None, portfolio_before=None,
+                portfolio_after=None,
+            )
+
+    status_path = tmp_path / "status.json"
+    observation_cycle = Cycle("observation")
+    observation = AutonomousTrader(
+        symbol="SPY", cycle_service=observation_cycle, session_provider=Sessions(),
+        clock=FakeClock(session_date), status_store=StatusStore(status_path),
+    )
+    observation.start()
+    assert len(observation.run_due_cycles()) == 1
+    assert observation.status.latest_completed_session == "2024-01-08"
+
+    execution_cycle = Cycle("paper_execution")
+    execution = AutonomousTrader(
+        symbol="SPY", cycle_service=execution_cycle, session_provider=Sessions(),
+        clock=FakeClock(session_date), status_store=StatusStore(status_path),
+    )
+    execution.start()
+    assert len(execution.run_due_cycles()) == 1
+    assert execution_cycle.calls == 1
+    assert execution.status.latest_completed_session == "2024-01-08"

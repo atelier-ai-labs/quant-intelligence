@@ -25,6 +25,25 @@ from quant_intelligence.trading.persistence import PersistenceConfigurationError
 from quant_intelligence.trading.operations import activity_view, soak_summary, status_view
 from quant_intelligence.trading.runtime import CriticalResetError, CriticalRiskResetService, RuntimeConfigurationError, ServiceAlreadyRunning, ServiceConfig, build_persistent_service
 
+
+def _alpaca_operational_repository(audit_dir: Path, *, execution_enabled: bool):
+    """Select persistence independently from Alpaca order-submission mode.
+
+    Paper execution requires PostgreSQL because durable operational state must be
+    written before an external order is submitted. Observation/dry-run may use
+    either explicitly selected backend, but never silently falls back to JSON.
+    PostgreSQL dry-runs intentionally use the durable risk-state store as a
+    preflight: a detected risk halt remains visible to the later paper runner.
+    """
+    persistence_mode = os.getenv("QI_TRADING_PERSISTENCE", "postgres").lower()
+    if execution_enabled and persistence_mode != "postgres":
+        raise PersistenceConfigurationError("Alpaca execution requires QI_TRADING_PERSISTENCE=postgres")
+    return operational_repository(
+        audit_dir,
+        database_url=os.getenv("DATABASE_URL"),
+        mode=persistence_mode,
+    ), persistence_mode
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="quant-intelligence")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -210,19 +229,25 @@ def main() -> None:
         broker = AlpacaBroker(execution_config, state_path=audit_dir / "alpaca_orders.json")
         session_provider = AlpacaMarketSessionProvider(broker.client)
         try:
-            repository = operational_repository(audit_dir, database_url=os.getenv("DATABASE_URL") if execution_config.execution_enabled else None, mode="postgres" if execution_config.execution_enabled else "json")
+            repository, persistence_mode = _alpaca_operational_repository(audit_dir, execution_enabled=execution_config.execution_enabled)
         except PersistenceConfigurationError as exc:
-            parser.error(f"Alpaca execution requires PostgreSQL operational persistence: {exc}")
+            parser.error(f"Alpaca operational persistence unavailable: {exc}")
         reconciliation_service = BrokerReconciliation(broker, audit_dir / "reconciliation", repository=repository)
         risk_config = RiskConfig(max_position_allocation=args.max_position_allocation, max_order_notional=args.max_order_notional)
-        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(risk_config), audit_store=repository, execution_mode="paper_execution" if execution_config.execution_enabled else "observation", max_execution_shares=args.max_order_shares, risk_state_store=repository if execution_config.execution_enabled else None, risk_config=risk_config)
+        service = TradingCycleService(strategy=SmaTrendStrategy(args.window), broker=broker, market_data=provider, risk_gate=RiskGate(risk_config), audit_store=repository, execution_mode="paper_execution" if execution_config.execution_enabled else "observation", max_execution_shares=args.max_order_shares, risk_state_store=repository if persistence_mode == "postgres" else None, risk_config=risk_config)
         trader = AutonomousTrader(symbol=args.symbol, cycle_service=service, scheduler=None, clock=SystemClock(), status_store=repository, session_provider=session_provider, post_close_delay=timedelta(minutes=args.post_close_delay_minutes), reconciliation_service=reconciliation_service)
+        trader.status.mode = "paper"
+        trader.status.execution_enabled = execution_config.execution_enabled
+        repository.save_status(trader.status)
         trader.start()
         try:
             if args.dry_run_once:
                 next_time = trader.next_decision_time()
                 decisions = trader.run_due_cycles()
-                print(json.dumps({"mode": "dry-run", "symbol": args.symbol, "latest_completed_session": trader.status.latest_completed_session, "next_decision": next_time, "trading_health": trader.status.trading_health, "halt_reason": trader.status.halt_reason, "decision": asdict(decisions[0]) if decisions else None}, default=str, indent=2))
+                observed_session = trader.status.latest_completed_session
+                if decisions and decisions[0].data_timestamp is not None:
+                    observed_session = decisions[0].data_timestamp.date().isoformat()
+                print(json.dumps({"mode": "dry-run", "symbol": args.symbol, "latest_completed_session": observed_session, "next_decision": next_time, "trading_health": trader.status.trading_health, "halt_reason": trader.status.halt_reason, "decision": asdict(decisions[0]) if decisions else None}, default=str, indent=2))
             else:
                 while True:
                     trader.run_due_cycles()

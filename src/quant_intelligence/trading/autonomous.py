@@ -75,7 +75,8 @@ class AutonomousTrader:
         session_key = session.session_date.isoformat()
         if not self._preflight():
             return []
-        if self.status.latest_completed_session == session_key:
+        observation_only = getattr(self.cycle_service, "execution_mode", "paper") == "observation"
+        if self._session_already_processed(session_key, observation_only=observation_only):
             return []
         logger.info("scheduler_trigger", extra={"symbol": self.symbol, "session": session_key})
         logger.info("cycle_started", extra={"symbol": self.symbol, "session": session_key})
@@ -100,6 +101,26 @@ class AutonomousTrader:
         self._persist_status()
         self._log_decision(decision)
         return [decision]
+
+    def _session_already_processed(self, session_key: str, *, observation_only: bool) -> bool:
+        """Use mode-specific audit history for session idempotency.
+
+        OperationalStatus has one operator-facing latest-session marker, while
+        observation and paper execution intentionally have distinct cycle
+        identities. The audit record for the active mode is therefore the
+        authoritative duplicate gate when available.
+        """
+        if observation_only or self.status.latest_completed_session != session_key:
+            return False
+        audit_store = getattr(self.cycle_service, "audit_store", None)
+        list_decisions = getattr(audit_store, "list", None)
+        if callable(list_decisions):
+            execution_mode = getattr(self.cycle_service, "execution_mode", "paper")
+            return any(
+                decision.market_session == session_key and (decision.execution_mode or "paper") == execution_mode
+                for decision in list_decisions()
+            )
+        return True
 
     def _run_interval_cycles(self, current: datetime) -> list[TradingDecision]:
         if self.scheduler is None:
