@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -171,3 +172,13 @@ def test_alembic_0002_upgrade_and_safe_downgrade(tmp_path, monkeypatch):
     engine = create_engine(database_url)
     assert inspect(engine).get_table_names() == ["alembic_version"]
     engine.dispose()
+
+
+def test_alembic_revision_ids_fit_version_column_width():
+    config = Config("alembic.ini")
+    script = ScriptDirectory.from_config(config)
+    revisions = list(script.walk_revisions())
+    assert revisions
+    assert all(len(revision.revision) <= 32 for revision in revisions)
+    latest = script.get_revision("0004_authoritative_session")
+    assert latest is not None and latest.down_revision == "0003_operational_events"
