@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import re
 from decimal import Decimal
 from dataclasses import asdict
 from datetime import datetime
@@ -48,6 +49,7 @@ from .models import (
 )
 from .status import OperationalStatus, StatusStore
 from .risk import RiskConfig, RiskEvaluation, RiskMode, RiskState, RiskStateService
+from .reconciliation import RECOVERABLE_RECONCILIATION_STATUSES, TERMINAL_ORDER_STATUSES, expected_post_trade_position, pre_trade_position
 
 
 class PersistenceConfigurationError(RuntimeError):
@@ -443,6 +445,44 @@ class SqlAlchemyOperationalRepository:
     def _operational_event_dict(row: OperationalEventRow) -> dict[str, Any]:
         return {"id": row.id, "event_key": row.event_key, "event_type": row.event_type, "service_state": row.service_state, "trading_health": row.trading_health, "risk_mode": row.risk_mode, "reason": row.reason, "metadata": row.event_payload, "created_at": row.created_at}
 
+    @staticmethod
+    def _reconciliation_expected_position(row: ReconciliationRow, cycle: TradingCycleRow | None) -> int | None:
+        payload = cycle.reconciliation_payload if cycle else None
+        if isinstance(payload, dict):
+            value = payload.get("expected_position")
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        match = re.search(r"expected_position=(-?\d+|None)", row.action_taken or "")
+        if match and match.group(1) != "None":
+            value = int(match.group(1))
+            return value if value >= 0 else None
+        if cycle is not None:
+            intent = cycle.execution_order or cycle.proposed_order or {}
+            quantity = int(intent.get("quantity", 0) or 0)
+            return expected_post_trade_position(cycle.portfolio_before, row.symbol, intent.get("side"), quantity)
+        return None
+
+    @classmethod
+    def _mismatch_candidate(cls, session: Session, row: ReconciliationRow) -> dict[str, Any] | None:
+        order = session.get(OrderRow, row.order_id) if row.order_id else None
+        cycle = session.get(TradingCycleRow, row.cycle_id) if row.cycle_id else None
+        intent = (cycle.execution_order or cycle.proposed_order or {}) if cycle else {}
+        client_id = order.client_order_id if order else intent.get("client_order_id")
+        if not client_id:
+            return None
+        quantity = order.submitted_quantity if order else row.expected_quantity
+        side = order.side if order else intent.get("side")
+        return {
+            "cycle_id": row.cycle_id or (cycle.id if cycle else client_id),
+            "client_order_id": client_id,
+            "symbol": row.symbol,
+            "submitted_quantity": quantity,
+            "status": "MISMATCH",
+            "expected_position": cls._reconciliation_expected_position(row, cycle),
+            "pre_trade_position": pre_trade_position(cycle.portfolio_before if cycle else None, row.symbol),
+            "side": side,
+        }
+
     def record_operational_event(self, event_type: str, *, timestamp: datetime, event_key: str | None = None, service_state: str | None = None, trading_health: str | None = None, risk_mode: str | None = None, reason: str | None = None, metadata: dict[str, Any] | None = None) -> None:
         with Session(self.engine) as session:
             if event_key and session.scalar(select(OperationalEventRow.id).where(OperationalEventRow.event_key == event_key)) is not None:
@@ -451,19 +491,37 @@ class SqlAlchemyOperationalRepository:
             session.commit()
 
     def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]:
-        terminal = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
         candidates: dict[str, dict[str, Any]] = {}
         with Session(self.engine) as session:
-            order_query = select(OrderRow).where(OrderRow.status.notin_(terminal))
+            latest_reconciliations: dict[str, ReconciliationRow] = {}
+            reconciliation_query = select(ReconciliationRow).order_by(ReconciliationRow.reconciled_at.desc())
+            for reconciliation in session.scalars(reconciliation_query).all():
+                order = session.get(OrderRow, reconciliation.order_id) if reconciliation.order_id else None
+                cycle = session.get(TradingCycleRow, reconciliation.cycle_id) if reconciliation.cycle_id else None
+                intent = (cycle.execution_order or cycle.proposed_order or {}) if cycle else {}
+                client_id = order.client_order_id if order else intent.get("client_order_id")
+                if client_id and client_id not in latest_reconciliations:
+                    latest_reconciliations[client_id] = reconciliation
+
+            def is_resolved(client_id: str) -> bool:
+                latest = latest_reconciliations.get(client_id)
+                return latest is not None and latest.status in TERMINAL_ORDER_STATUSES
+
+            order_query = select(OrderRow).where(OrderRow.status.notin_(TERMINAL_ORDER_STATUSES))
             if symbol:
                 order_query = order_query.where(OrderRow.symbol == symbol)
             for order in session.scalars(order_query).all():
+                if is_resolved(order.client_order_id):
+                    continue
+                cycle = session.get(TradingCycleRow, order.cycle_id)
                 candidates[order.client_order_id] = {
                     "cycle_id": order.cycle_id,
                     "client_order_id": order.client_order_id,
                     "symbol": order.symbol,
                     "submitted_quantity": order.submitted_quantity,
                     "status": order.status,
+                    "expected_position": expected_post_trade_position(cycle.portfolio_before if cycle else None, order.symbol, order.side, order.submitted_quantity),
+                    "pre_trade_position": pre_trade_position(cycle.portfolio_before if cycle else None, order.symbol),
                 }
             cycle_query = select(TradingCycleRow).where(TradingCycleRow.outcome.in_(("PENDING_SUBMISSION", "UNKNOWN")))
             if symbol:
@@ -471,14 +529,28 @@ class SqlAlchemyOperationalRepository:
             for cycle in session.scalars(cycle_query).all():
                 intent = cycle.execution_order or cycle.proposed_order or {}
                 client_id = intent.get("client_order_id")
-                if client_id:
+                if client_id and not is_resolved(client_id):
                     candidates.setdefault(client_id, {
                         "cycle_id": cycle.id,
                         "client_order_id": client_id,
                         "symbol": cycle.symbol,
                         "submitted_quantity": int(intent.get("quantity", 0) or 0),
                         "status": cycle.outcome,
+                        "expected_position": expected_post_trade_position(cycle.portfolio_before, cycle.symbol, intent.get("side"), int(intent.get("quantity", 0) or 0)),
+                        "pre_trade_position": pre_trade_position(cycle.portfolio_before, cycle.symbol),
                     })
+            seen_reconciliations: set[str] = set()
+            for reconciliation in session.scalars(reconciliation_query).all():
+                order = session.get(OrderRow, reconciliation.order_id) if reconciliation.order_id else None
+                key = order.client_order_id if order else (reconciliation.cycle_id or reconciliation.id)
+                if key in seen_reconciliations:
+                    continue
+                seen_reconciliations.add(key)
+                if reconciliation.status not in RECOVERABLE_RECONCILIATION_STATUSES:
+                    continue
+                candidate = self._mismatch_candidate(session, reconciliation)
+                if candidate:
+                    candidates[candidate["client_order_id"]] = candidate
         return list(candidates.values())
 
     def load_risk_state(self, account_key: str = "default") -> RiskState | None:
@@ -650,8 +722,12 @@ class SqlAlchemyOperationalRepository:
         with Session(self.engine) as session:
             cycle = session.get(TradingCycleRow, result.cycle_id)
             order = session.scalar(select(OrderRow).where(OrderRow.client_order_id == result.client_order_id))
-            session.add(ReconciliationRow(id=f"{result.cycle_id}:{result.last_reconciled_at.isoformat()}", cycle_id=cycle.id if cycle else None, order_id=order.id if order else None, symbol=result.symbol, expected_quantity=result.expected_quantity, observed_quantity=result.observed_filled_quantity, status=result.status, action_taken="persisted before broker mirror synchronization", reconciled_at=result.last_reconciled_at))
-            if result.observed_position is not None:
+            session.add(ReconciliationRow(id=f"{result.cycle_id}:{result.last_reconciled_at.isoformat()}", cycle_id=cycle.id if cycle else None, order_id=order.id if order else None, symbol=result.symbol, expected_quantity=result.expected_quantity, observed_quantity=result.observed_filled_quantity, status=result.status, action_taken=f"persisted before broker mirror synchronization; expected_position={result.expected_position}; observed_position={result.observed_position}", reconciled_at=result.last_reconciled_at))
+            if cycle is not None:
+                cycle.reconciliation_payload = _json_value(asdict(result))
+            session.commit()
+        if result.observed_position is not None:
+            with Session(self.engine) as session:
                 current = session.get(ManagedPositionRow, result.symbol)
                 if current is None:
                     current = ManagedPositionRow(symbol=result.symbol, quantity=result.observed_position, average_price=None)
@@ -659,7 +735,7 @@ class SqlAlchemyOperationalRepository:
                 else:
                     current.quantity = result.observed_position
                 current.last_reconciled_at = result.last_reconciled_at
-            session.commit()
+                session.commit()
 
 
 class JsonOperationalRepository:
@@ -710,12 +786,40 @@ class JsonOperationalRepository:
 
     def pending_reconciliations(self, symbol: str | None = None) -> list[dict[str, Any]]:
         candidates = []
+        latest_by_client: dict[str, dict[str, Any]] = {}
+        reconciliation_dir = self.audit.root / "reconciliations"
+        payloads: list[dict[str, Any]] = []
+        if reconciliation_dir.is_dir():
+            for path in reconciliation_dir.glob("*.json"):
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict) and payload.get("client_order_id"):
+                    payloads.append(payload)
+        for payload in sorted(payloads, key=lambda item: str(item.get("last_reconciled_at", "")), reverse=True):
+            latest_by_client.setdefault(str(payload["client_order_id"]), payload)
+
+        def is_resolved(client_id: str) -> bool:
+            return str(latest_by_client.get(client_id, {}).get("status", "")).upper() in TERMINAL_ORDER_STATUSES
+
         for decision in self.list():
             if decision.outcome not in {"PENDING_SUBMISSION", "UNKNOWN"} or (symbol and decision.symbol != symbol):
                 continue
             intent = decision.execution_order or decision.proposed_order
-            if intent and intent.client_order_id:
-                candidates.append({"cycle_id": decision.cycle_id, "client_order_id": intent.client_order_id, "symbol": decision.symbol, "submitted_quantity": intent.quantity, "status": decision.outcome})
+            if intent and intent.client_order_id and not is_resolved(intent.client_order_id):
+                candidates.append({"cycle_id": decision.cycle_id, "client_order_id": intent.client_order_id, "symbol": decision.symbol, "submitted_quantity": intent.quantity, "status": decision.outcome, "expected_position": expected_post_trade_position(decision.portfolio_before, decision.symbol, intent.side, intent.quantity), "pre_trade_position": pre_trade_position(decision.portfolio_before, decision.symbol)})
+        latest_by_client: set[str] = set()
+        for payload in sorted(payloads, key=lambda item: str(item.get("last_reconciled_at", "")), reverse=True):
+            client_id = payload.get("client_order_id")
+            if not client_id or client_id in latest_by_client:
+                continue
+            latest_by_client.add(client_id)
+            if payload.get("status") not in RECOVERABLE_RECONCILIATION_STATUSES or (symbol and payload.get("symbol") != symbol):
+                continue
+            decision = self.get(payload.get("cycle_id", ""))
+            intent = decision.execution_order or decision.proposed_order if decision else None
+            candidates.append({"cycle_id": payload.get("cycle_id") or client_id, "client_order_id": client_id, "symbol": payload.get("symbol"), "submitted_quantity": int(payload.get("expected_quantity", 0) or 0), "status": "MISMATCH", "expected_position": payload.get("expected_position"), "pre_trade_position": pre_trade_position(decision.portfolio_before, payload.get("symbol")) if decision else None, "side": intent.side if intent else None})
         return candidates
 
     def list_orders(self, limit: int = 25) -> list[dict[str, Any]]:

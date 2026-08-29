@@ -9,7 +9,7 @@ from quant_intelligence.trading.audit import TradingAuditStore
 from quant_intelligence.trading.broker import BrokerError, BrokerSubmissionUnknown
 from quant_intelligence.trading.cycle import TradingCycleService
 from quant_intelligence.trading.models import Order, OrderIntent, Position, SignalAction
-from quant_intelligence.trading.reconciliation import BrokerReconciliation
+from quant_intelligence.trading.reconciliation import BrokerReconciliation, expected_post_trade_position, pre_trade_position
 from quant_intelligence.trading.risk import RiskConfig, RiskGate
 
 NOW = datetime(2020, 1, 4, 12, tzinfo=timezone.utc)
@@ -84,6 +84,15 @@ class FakeTradingClient:
         return self.remote
 
 
+class PositionedTradingClient(FakeTradingClient):
+    def __init__(self, remote=None, positions=()):
+        super().__init__(remote)
+        self.positions = list(positions)
+
+    def get_all_positions(self):
+        return self.positions
+
+
 def remote_order(status="new", filled_qty="0", filled_avg_price=None):
     return SimpleNamespace(id="alpaca-order-1", client_order_id="qi-cycle", symbol="SYNTH", side="buy", qty="10", status=status, submitted_at=NOW, filled_qty=filled_qty, filled_avg_price=filled_avg_price)
 
@@ -137,6 +146,87 @@ def test_preflight_refuses_unknown_local_order(tmp_path):
     client.remote = None
     with pytest.raises(BrokerError, match="unresolved"):
         broker.preflight("SYNTH")
+
+
+def test_preflight_does_not_clear_terminal_order_without_reconciliation(tmp_path):
+    client = FakeTradingClient(remote_order("filled", "3", "10"))
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=tmp_path / "orders.json")
+    broker.order_metadata["qi-open"] = {"cycle_id": "cycle-open", "client_order_id": "qi-open", "symbol": "SYNTH", "submitted_quantity": 3, "status": "SUBMITTED"}
+    broker.unresolved_symbols.add("SYNTH")
+    with pytest.raises(BrokerError, match="unresolved"):
+        broker.preflight("SYNTH")
+    assert "SYNTH" in broker.unresolved_symbols
+
+
+@pytest.mark.parametrize("terminal_state", ["filled", "canceled", "rejected", "expired"])
+def test_terminal_metadata_is_not_pending_after_restart(tmp_path, terminal_state):
+    filled = "3" if terminal_state == "filled" else "0"
+    client = FakeTradingClient(remote_order(terminal_state, filled, "10" if filled == "3" else None))
+    state_path = tmp_path / "orders.json"
+    first = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    first.order_metadata["qi-terminal"] = {"cycle_id": "cycle-terminal", "client_order_id": "qi-terminal", "symbol": "SYNTH", "submitted_quantity": 3, "status": {"filled": "FILLED", "canceled": "CANCELED", "rejected": "REJECTED", "expired": "EXPIRED"}[terminal_state]}
+    first._save_metadata()
+    restarted = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    assert BrokerReconciliation(restarted, tmp_path / "reconciliation").reconcile_pending("SYNTH") == []
+    restarted.preflight("SYNTH")
+
+
+@pytest.mark.parametrize("remote_state", ["new", "accepted", "partially_filled"])
+def test_nonterminal_metadata_remains_pending_after_restart(tmp_path, remote_state):
+    filled = "1" if remote_state == "partially_filled" else "0"
+    client = FakeTradingClient(remote_order(remote_state, filled, "10" if filled == "1" else None))
+    state_path = tmp_path / "orders.json"
+    first = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    first.order_metadata["qi-open"] = {"cycle_id": "cycle-open", "client_order_id": "qi-open", "symbol": "SYNTH", "submitted_quantity": 3, "status": {"new": "SUBMITTED", "accepted": "ACCEPTED", "partially_filled": "PARTIALLY_FILLED"}[remote_state]}
+    first._save_metadata()
+    restarted = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    results = BrokerReconciliation(restarted, tmp_path / "reconciliation").reconcile_pending("SYNTH")
+    assert len(results) == 1 and results[0].status == "UNRESOLVED"
+    assert "SYNTH" in restarted.unresolved_symbols
+
+
+def test_terminal_metadata_does_not_create_position_mismatch_without_context(tmp_path):
+    client = PositionedTradingClient(remote_order("filled", "3", "10"), positions=[SimpleNamespace(symbol="SYNTH", qty="5", avg_entry_price="10")])
+    state_path = tmp_path / "orders.json"
+    first = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    first.order_metadata["qi-terminal"] = {"cycle_id": "cycle-terminal", "client_order_id": "qi-terminal", "symbol": "SYNTH", "submitted_quantity": 3, "status": "FILLED"}
+    first.unresolved_symbols.add("SYNTH")
+    first._save_metadata()
+    restarted = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    assert BrokerReconciliation(restarted, tmp_path / "reconciliation").reconcile_pending("SYNTH") == []
+    assert "SYNTH" not in restarted.unresolved_symbols
+
+
+def test_durable_repository_prevents_stale_json_metadata_from_resurrecting_work(tmp_path):
+    class DurableRepository:
+        def pending_reconciliations(self, symbol=None):
+            return []
+
+    client = PositionedTradingClient(remote_order("filled", "3", "10"), positions=[SimpleNamespace(symbol="SYNTH", qty="5", avg_entry_price="10")])
+    state_path = tmp_path / "orders.json"
+    first = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    first.order_metadata["qi-stale"] = {"cycle_id": "cycle-stale", "client_order_id": "qi-stale", "symbol": "SYNTH", "submitted_quantity": 3, "status": "SUBMITTED"}
+    first._save_metadata()
+    restarted = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request, state_path=state_path)
+    assert BrokerReconciliation(restarted, tmp_path / "reconciliation", repository=DurableRepository()).reconcile_pending("SYNTH") == []
+
+
+@pytest.mark.parametrize(
+    "portfolio_before",
+    [
+        {"positions": "malformed"},
+        {"positions": {"SYNTH": 2}},
+        {"positions": [{"symbol": "SYNTH", "shares": 2}, {"symbol": "SYNTH", "shares": 2}]},
+        {"positions": [{"symbol": "SYNTH", "shares": "2"}]},
+    ],
+)
+def test_malformed_durable_position_state_remains_blocked(tmp_path, portfolio_before):
+    client = PositionedTradingClient(remote_order("filled", "3", "10"), positions=[SimpleNamespace(symbol="SYNTH", qty="5", avg_entry_price="10")])
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    broker.unresolved_symbols.add("SYNTH")
+    result = BrokerReconciliation(broker, tmp_path, repository=pending_repository(expected_position=expected_post_trade_position(portfolio_before, "SYNTH", SignalAction.BUY, 3), pre_trade_position=pre_trade_position(portfolio_before, "SYNTH"))).reconcile_pending("SYNTH")[0]
+    assert result.status == "MISMATCH"
+    assert "SYNTH" in broker.unresolved_symbols
 
 
 def test_lifecycle_states_and_bounded_polling():
@@ -218,7 +308,68 @@ def test_reconciliation_preserves_position_mismatch(tmp_path):
     assert '"expected_position": 1' in payload and '"observed_position": 0' in payload
 
 
-@pytest.mark.parametrize("remote_state", ["new", "partially_filled"])
+def pending_repository(*, expected_position, pre_trade_position, quantity=3, side="BUY"):
+    class Repository:
+        def __init__(self):
+            self.results = []
+
+        def pending_reconciliations(self, symbol=None):
+            return [{"cycle_id": "cycle-pending", "client_order_id": "qi-pending", "symbol": "SYNTH", "submitted_quantity": quantity, "status": "SUBMITTED", "side": side, "expected_position": expected_position, "pre_trade_position": pre_trade_position}]
+
+        def save_reconciliation(self, result):
+            self.results.append(result)
+
+    return Repository()
+
+
+def test_pending_filled_buy_with_wrong_position_remains_blocked(tmp_path):
+    client = PositionedTradingClient(remote_order("filled", "3", "10"), positions=())
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    broker.unresolved_symbols.add("SYNTH")
+    repository = pending_repository(expected_position=5, pre_trade_position=2)
+    result = BrokerReconciliation(broker, tmp_path, repository=repository).reconcile_pending("SYNTH")[0]
+    assert result.status == "MISMATCH"
+    assert "SYNTH" in broker.unresolved_symbols
+    assert repository.results[0].expected_position == 5 and repository.results[0].observed_position == 0
+
+
+def test_pending_filled_buy_with_partial_position_remains_blocked(tmp_path):
+    client = PositionedTradingClient(remote_order("filled", "3", "10"), positions=[SimpleNamespace(symbol="SYNTH", qty="4", avg_entry_price="10")])
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    broker.unresolved_symbols.add("SYNTH")
+    result = BrokerReconciliation(broker, tmp_path, repository=pending_repository(expected_position=5, pre_trade_position=2)).reconcile_pending("SYNTH")[0]
+    assert result.status == "MISMATCH" and "SYNTH" in broker.unresolved_symbols
+
+
+def test_pending_filled_buy_with_matching_position_clears_block(tmp_path):
+    client = PositionedTradingClient(remote_order("filled", "3", "10"), positions=[SimpleNamespace(symbol="SYNTH", qty="5", avg_entry_price="10")])
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    broker.unresolved_symbols.add("SYNTH")
+    result = BrokerReconciliation(broker, tmp_path, repository=pending_repository(expected_position=5, pre_trade_position=2)).reconcile_pending("SYNTH")[0]
+    assert result.status == "FILLED" and "SYNTH" not in broker.unresolved_symbols
+
+
+def test_pending_filled_sell_requires_matching_reduced_position(tmp_path):
+    remote = remote_order("filled", "2", "10")
+    remote.side = "sell"
+    client = PositionedTradingClient(remote, positions=[SimpleNamespace(symbol="SYNTH", qty="4", avg_entry_price="10")])
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    broker.unresolved_symbols.add("SYNTH")
+    result = BrokerReconciliation(broker, tmp_path, repository=pending_repository(expected_position=3, pre_trade_position=5, quantity=2, side="SELL")).reconcile_pending("SYNTH")[0]
+    assert result.status == "MISMATCH" and "SYNTH" in broker.unresolved_symbols
+
+
+def test_pending_filled_sell_to_zero_accepts_absent_position(tmp_path):
+    remote = remote_order("filled", "5", "10")
+    remote.side = "sell"
+    client = PositionedTradingClient(remote, positions=())
+    broker = AlpacaBroker(AlpacaConfig("key", "secret", execution_enabled=True), trading_client=client, order_request_builder=build_request)
+    broker.unresolved_symbols.add("SYNTH")
+    result = BrokerReconciliation(broker, tmp_path, repository=pending_repository(expected_position=0, pre_trade_position=5, quantity=5, side="SELL")).reconcile_pending("SYNTH")[0]
+    assert result.status == "FILLED" and result.observed_position == 0 and "SYNTH" not in broker.unresolved_symbols
+
+
+@pytest.mark.parametrize("remote_state", ["new", "accepted", "partially_filled"])
 def test_durable_pending_order_blocks_until_terminal_without_local_metadata(tmp_path, remote_state):
     class DurableRepository:
         def pending_reconciliations(self, symbol=None):
@@ -235,6 +386,7 @@ def test_durable_pending_order_blocks_until_terminal_without_local_metadata(tmp_
     assert len(results) == 1
     assert results[0].status == "UNRESOLVED"
     assert results[0].client_order_id == "qi-durable"
+    assert "SYNTH" in broker.unresolved_symbols
 
 
 def test_preflight_blocks_recognized_open_order(tmp_path):

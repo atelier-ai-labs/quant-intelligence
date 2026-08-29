@@ -1,4 +1,5 @@
 from datetime import date, datetime, time, timedelta, timezone
+from types import SimpleNamespace
 
 from quant_intelligence.strategies import SmaTrendStrategy
 from quant_intelligence.trading import AlpacaMarketSessionProvider, AutonomousTrader, FakeClock, FixtureMarketSessionProvider, MarketSession, PaperBroker, TradingCycleService
@@ -7,7 +8,9 @@ from quant_intelligence.trading.market import FixtureMarketDataProvider
 from quant_intelligence.trading.risk import RiskConfig, RiskGate
 from quant_intelligence.trading.models import Position
 from quant_intelligence.trading.status import StatusStore
-from quant_intelligence.trading.persistence import SqlAlchemyOperationalRepository
+from quant_intelligence.trading.persistence import OrderRow, SqlAlchemyOperationalRepository, TradingCycleRow
+from quant_intelligence.trading.reconciliation import BrokerReconciliation
+from sqlalchemy.orm import Session
 from quant_intelligence.trading.status import OperationalStatus
 from tests.integration.test_trading import bars
 
@@ -129,3 +132,54 @@ def test_daily_halt_session_runner_executes_full_risk_reduction(tmp_path):
     assert decision.signal.value == "SELL" and decision.outcome == "EXECUTED"
     assert decision.risk_decision.mode == "DAILY_HALT" and broker.get_positions() == ()
     assert trader.status.risk_mode == "DAILY_HALT" and trader.status.trading_health == "halted"
+
+
+def test_restart_and_next_session_remain_blocked_on_filled_position_mismatch(tmp_path):
+    repository = SqlAlchemyOperationalRepository(f"sqlite+pysqlite:///{tmp_path / 'operational.db'}", create_schema=True)
+    timestamp = datetime(2024, 7, 3, 19, tzinfo=UTC)
+    before = {"timestamp": timestamp.isoformat(), "cash": 980.0, "positions": [{"symbol": "SYNTH", "shares": 2, "average_price": 10.0}], "asset_value": 20.0, "equity": 1000.0, "transaction_costs_paid": 0.0}
+    intent = {"symbol": "SYNTH", "side": "BUY", "quantity": 3, "order_type": "MARKET", "asset_type": "EQUITY", "reason": "test", "client_order_id": "qi-mismatch", "cycle_id": "cycle-mismatch"}
+    with Session(repository.engine) as db:
+        db.add(TradingCycleRow(id="cycle-mismatch", strategy_name="sma_trend", strategy_version="1", symbol="SYNTH", market_session="2024-07-03", market_data_timestamp=timestamp, mode="paper_execution", signal="BUY", outcome="PENDING_SUBMISSION", created_at=timestamp, updated_at=timestamp, strategy_parameters={}, signal_reason="test", risk_approved=True, risk_reason="approved", portfolio_before=before, proposed_order=intent, execution_order=intent))
+        db.flush()
+        db.add(OrderRow(id="order-mismatch", cycle_id="cycle-mismatch", client_order_id="qi-mismatch", symbol="SYNTH", side="BUY", requested_quantity=3, submitted_quantity=3, filled_quantity=0, status="SUBMITTED", submitted_at=timestamp, updated_at=timestamp))
+        db.commit()
+
+    class Broker:
+        def __init__(self):
+            self.submit_calls = 0
+            self.unresolved_symbols = set()
+
+        def get_order_by_client_id(self, client_order_id):
+            return SimpleNamespace(status="FILLED", filled_quantity=3, broker_order_id="broker-mismatch", intent=SimpleNamespace(side="BUY"))
+
+        def get_positions(self):
+            return ()
+
+        def preflight(self, symbol):
+            return 1000.0, ()
+
+        def clear_unresolved_symbol(self, symbol):
+            self.unresolved_symbols.discard(symbol)
+
+        def submit_order(self, *args, **kwargs):
+            self.submit_calls += 1
+            raise AssertionError("mismatched position must block submission")
+
+    def make_trader(broker, clock):
+        cycle = TradingCycleService(strategy=SmaTrendStrategy(3), broker=broker, market_data=FixtureMarketDataProvider("SYNTH", bars([10, 11, 12]), data_timestamp=timestamp, max_age=timedelta(days=2)), risk_gate=RiskGate(transaction_cost_bps=0), audit_store=repository, execution_mode="paper_execution", risk_state_store=repository)
+        return AutonomousTrader(symbol="SYNTH", cycle_service=cycle, clock=clock, status_store=repository, session_provider=FixtureMarketSessionProvider((session(date(2024, 7, 3), 13), session(date(2024, 7, 5)))), post_close_delay=timedelta(minutes=5), reconciliation_service=BrokerReconciliation(broker, tmp_path / "reconciliation", repository=repository))
+
+    clock = FakeClock(timestamp)
+    first_broker = Broker()
+    first = make_trader(first_broker, clock)
+    first.start()
+    assert first.run_due_cycles() == [] and first_broker.submit_calls == 0
+    assert "SYNTH" in first_broker.unresolved_symbols
+
+    clock.advance(timedelta(days=3))
+    restarted_broker = Broker()
+    restarted = make_trader(restarted_broker, clock)
+    restarted.start()
+    assert restarted.run_due_cycles() == [] and restarted_broker.submit_calls == 0
+    assert "SYNTH" in restarted_broker.unresolved_symbols

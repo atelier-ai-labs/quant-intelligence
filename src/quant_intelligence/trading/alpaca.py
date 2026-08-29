@@ -17,6 +17,7 @@ from quant_intelligence.models import Bar
 from .broker import BrokerError, BrokerSubmissionUnknown, BrokerUnavailable, ExecutionDisabled
 from .market import MarketDataSnapshot, MarketDataUnavailable
 from .models import Fill, Order, OrderIntent, PortfolioSnapshot, Position, SignalAction
+from .reconciliation import TERMINAL_ORDER_STATUSES
 from .sessions import MarketSession
 
 
@@ -308,7 +309,7 @@ class AlpacaBroker:
         positions = self.get_positions()
         for key, metadata in list(self.order_metadata.items()):
             client_id = metadata.get("client_order_id")
-            if not client_id or metadata.get("status") in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "MISSING"}:
+            if not client_id or metadata.get("status") in TERMINAL_ORDER_STATUSES | {"MISSING"}:
                 continue
             remote = self.get_order_by_client_id(client_id)
             if remote is None:
@@ -321,8 +322,8 @@ class AlpacaBroker:
             metadata["average_fill_price"] = remote.average_fill_price
             if remote.status in {"SUBMITTED", "ACCEPTED", "PARTIALLY_FILLED", "UNKNOWN"}:
                 self.unresolved_symbols.add(str(metadata.get("symbol", symbol)))
-            else:
-                self.unresolved_symbols.discard(str(metadata.get("symbol", symbol)))
+            # A terminal broker status is not sufficient to clear a symbol.
+            # BrokerReconciliation must verify the durable expected position.
         self._save_metadata()
         if symbol in self.unresolved_symbols:
             raise BrokerError(f"unresolved Alpaca state blocks {symbol}")
@@ -330,10 +331,9 @@ class AlpacaBroker:
 
     def poll_order(self, order: Order, *, attempts: int = 5, interval_seconds: float = 2.0, sleep: Any = time_module.sleep) -> tuple[Order, Fill | None]:
         """Poll only a bounded number of times; unresolved orders are never retried."""
-        terminal = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
         current = order
         for attempt in range(max(1, attempts)):
-            if current.status in terminal:
+            if current.status in TERMINAL_ORDER_STATUSES:
                 return current, self._fill_from_order(current)
             if attempt + 1 < max(1, attempts):
                 sleep(interval_seconds)
