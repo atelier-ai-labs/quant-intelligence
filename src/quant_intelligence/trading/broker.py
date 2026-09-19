@@ -1,12 +1,12 @@
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
 from quant_intelligence.portfolio import BasisPointCostModel
-from .models import Fill, Order, OrderIntent, PortfolioSnapshot, Position, SignalAction
+from .models import Fill, Order, OrderIntent, OrderStatus, PortfolioSnapshot, Position, SignalAction
 
 class BrokerError(RuntimeError):
     pass
@@ -20,8 +20,23 @@ class BrokerSubmissionUnknown(BrokerError):
 class ExecutionDisabled(BrokerError):
     """Observation mode intentionally refuses order submission."""
 
+
+BrokerOrderStatus = OrderStatus
+
+
+@dataclass(frozen=True)
+class BrokerAccount:
+    cash: float
+    equity: float | None
+    transaction_costs_paid: float = 0.0
+
+    def __iter__(self):
+        """Retain historical ``cash, costs = get_account()`` usage."""
+        yield self.cash
+        yield self.transaction_costs_paid
+
 class Broker(Protocol):
-    def get_account(self) -> tuple[float, float]: ...
+    def get_account(self) -> BrokerAccount: ...
     def get_positions(self) -> tuple[Position, ...]: ...
     def submit_order(self, intent: OrderIntent, price: float, timestamp: datetime) -> tuple[Order, Fill | None]: ...
     def get_order(self, order_id: str) -> Order | None: ...
@@ -39,8 +54,8 @@ class PaperBroker:
         self.state_path = Path(state_path) if state_path else None
         self._load_state()
 
-    def get_account(self) -> tuple[float, float]:
-        return self.cash, self.transaction_costs_paid
+    def get_account(self) -> BrokerAccount:
+        return BrokerAccount(self.cash, None, self.transaction_costs_paid)
 
     def get_positions(self) -> tuple[Position, ...]:
         return tuple(self.positions.values())
@@ -68,7 +83,7 @@ class PaperBroker:
             if remaining: self.positions[intent.symbol] = Position(intent.symbol, remaining, current.average_price)
             else: self.positions.pop(intent.symbol, None)
         else: raise BrokerError("broker accepts BUY or SELL orders only")
-        order = Order(uuid4().hex, intent, timestamp, "FILLED", intent.client_order_id, None, intent.quantity, price, timestamp)
+        order = Order(uuid4().hex, intent, timestamp, OrderStatus.FILLED, intent.client_order_id, None, intent.quantity, price, timestamp)
         fill = Fill(order.order_id, intent.symbol, intent.side, intent.quantity, price, gross, cost, timestamp)
         self.orders[order.order_id] = order; self.fills.append(fill); self.transaction_costs_paid += cost
         self._save_state()

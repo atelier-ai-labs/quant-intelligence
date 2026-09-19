@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Protocol, Sequence
+from typing import Protocol, Sequence
 from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
@@ -25,23 +25,6 @@ class MarketSessionProvider(Protocol):
     def latest_completed_session(self, now: datetime, post_close_delay: timedelta) -> MarketSession | None: ...
     def next_decision_time(self, now: datetime, post_close_delay: timedelta) -> datetime | None: ...
     def is_trading_day(self, session_date: date) -> bool: ...
-
-
-def _session_from_item(item: Any) -> MarketSession:
-    session_date = getattr(item, "date", None) or item.get("date")
-    opens = getattr(item, "open", None) or item.get("open")
-    closes = getattr(item, "close", None) or item.get("close")
-    if isinstance(session_date, datetime):
-        session_date = session_date.date()
-    if isinstance(session_date, str):
-        session_date = date.fromisoformat(session_date)
-    def normalize(value: Any) -> datetime:
-        if isinstance(value, datetime):
-            return value if value.tzinfo else value.replace(tzinfo=NEW_YORK)
-        return datetime.combine(session_date, time.fromisoformat(str(value)), tzinfo=NEW_YORK)
-    opens_at = normalize(opens).astimezone(UTC)
-    closes_at = normalize(closes).astimezone(UTC)
-    return MarketSession(session_date, opens_at, closes_at, closes_at.astimezone(NEW_YORK).time() < time(16, 0))
 
 
 class FixtureMarketSessionProvider:
@@ -70,28 +53,15 @@ class FixtureMarketSessionProvider:
 class AlpacaMarketSessionProvider:
     """Calendar adapter; Alpaca remains isolated from the trading domain."""
 
-    def __init__(self, trading_client: Any):
-        self.client = trading_client
+    def __init__(self, calendar_provider: object):
+        self.calendar_provider = calendar_provider
 
     def _calendar(self, now: datetime) -> tuple[MarketSession, ...]:
         current = now.astimezone(NEW_YORK).date()
-        try:
-            from alpaca.trading.requests import GetCalendarRequest
-            items = self.client.get_calendar(GetCalendarRequest(start=current - timedelta(days=14), end=current + timedelta(days=45)))
-        except TypeError:
-            # Small local fakes may expose the older keyword-shaped boundary.
-            try:
-                items = self.client.get_calendar(start=current - timedelta(days=14), end=current + timedelta(days=45))
-            except Exception as exc:
-                raise RuntimeError(f"market calendar unavailable: {exc.__class__.__name__}") from exc
-        except ImportError as exc:
-            raise RuntimeError("alpaca-py is required for the Alpaca market calendar") from exc
-        except Exception as exc:
-            raise RuntimeError(f"market calendar unavailable: {exc.__class__.__name__}") from exc
-        try:
-            return tuple(_session_from_item(item) for item in items or ())
-        except (AttributeError, KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("market calendar returned invalid session data") from exc
+        calendar = getattr(self.calendar_provider, "calendar", None)
+        if not callable(calendar):
+            raise RuntimeError("normalized market calendar provider is unavailable")
+        return tuple(calendar(current - timedelta(days=14), current + timedelta(days=45)))
 
     def latest_completed_session(self, now: datetime, post_close_delay: timedelta) -> MarketSession | None:
         current = now.astimezone(UTC)

@@ -319,7 +319,7 @@ def build_persistent_service(config: ServiceConfig, *, stop_event: Event | None 
             cycle_service=cycle,
             clock=SystemClock(),
             status_store=repository,
-            session_provider=AlpacaMarketSessionProvider(broker.client),
+            session_provider=AlpacaMarketSessionProvider(broker),
             post_close_delay=timedelta(minutes=config.post_close_delay_minutes),
             reconciliation_service=reconciliation,
         )

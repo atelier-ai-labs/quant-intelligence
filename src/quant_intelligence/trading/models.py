@@ -8,6 +8,18 @@ class SignalAction(StrEnum):
     SELL = "SELL"
     HOLD = "HOLD"
 
+
+class OrderStatus(StrEnum):
+    SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    UNKNOWN = "UNKNOWN"
+    PENDING_SUBMISSION = "PENDING_SUBMISSION"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
+
 @dataclass(frozen=True)
 class Signal:
     action: SignalAction
@@ -32,7 +44,7 @@ class Order:
     order_id: str
     intent: OrderIntent
     submitted_at: datetime
-    status: str
+    status: OrderStatus | str
     client_order_id: str | None = None
     broker_order_id: str | None = None
     filled_quantity: int = 0

@@ -38,9 +38,9 @@ def test_calendar_handles_weekend_holiday_early_close_and_delay():
 
 def test_alpaca_calendar_uses_supported_request_boundary():
     class CalendarClient:
-        def get_calendar(self, request):
-            assert request.start == date(2024, 7, 3) - timedelta(days=14)
-            return (type("CalendarItem", (), {"date": date(2024, 7, 3), "open": "09:30", "close": "13:00"})(),)
+        def calendar(self, start, end):
+            assert start == date(2024, 7, 3) - timedelta(days=14)
+            return (session(date(2024, 7, 3), 13),)
 
     provider = AlpacaMarketSessionProvider(CalendarClient())
     result = provider.latest_completed_session(datetime(2024, 7, 3, 18, 5, tzinfo=UTC), timedelta(minutes=5))
