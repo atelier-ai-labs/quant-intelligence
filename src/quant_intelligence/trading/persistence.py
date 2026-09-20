@@ -466,6 +466,8 @@ class SqlAlchemyOperationalRepository:
     def _mismatch_candidate(cls, session: Session, row: ReconciliationRow) -> dict[str, Any] | None:
         order = session.get(OrderRow, row.order_id) if row.order_id else None
         cycle = session.get(TradingCycleRow, row.cycle_id) if row.cycle_id else None
+        if cycle is not None and cycle.mode == "shadow":
+            return None
         intent = (cycle.execution_order or cycle.proposed_order or {}) if cycle else {}
         client_id = order.client_order_id if order else intent.get("client_order_id")
         if not client_id:
@@ -514,6 +516,8 @@ class SqlAlchemyOperationalRepository:
                 if is_resolved(order.client_order_id):
                     continue
                 cycle = session.get(TradingCycleRow, order.cycle_id)
+                if cycle is not None and cycle.mode == "shadow":
+                    continue
                 candidates[order.client_order_id] = {
                     "cycle_id": order.cycle_id,
                     "client_order_id": order.client_order_id,
@@ -523,7 +527,7 @@ class SqlAlchemyOperationalRepository:
                     "expected_position": expected_post_trade_position(cycle.portfolio_before if cycle else None, order.symbol, order.side, order.submitted_quantity),
                     "pre_trade_position": pre_trade_position(cycle.portfolio_before if cycle else None, order.symbol),
                 }
-            cycle_query = select(TradingCycleRow).where(TradingCycleRow.outcome.in_(("PENDING_SUBMISSION", "UNKNOWN")))
+            cycle_query = select(TradingCycleRow).where(TradingCycleRow.outcome.in_(("PENDING_SUBMISSION", "UNKNOWN")), TradingCycleRow.mode != "shadow")
             if symbol:
                 cycle_query = cycle_query.where(TradingCycleRow.symbol == symbol)
             for cycle in session.scalars(cycle_query).all():
@@ -721,6 +725,8 @@ class SqlAlchemyOperationalRepository:
     def save_reconciliation(self, result: Any) -> None:
         with Session(self.engine) as session:
             cycle = session.get(TradingCycleRow, result.cycle_id)
+            if cycle is not None and cycle.mode == "shadow":
+                return
             order = session.scalar(select(OrderRow).where(OrderRow.client_order_id == result.client_order_id))
             session.add(ReconciliationRow(id=f"{result.cycle_id}:{result.last_reconciled_at.isoformat()}", cycle_id=cycle.id if cycle else None, order_id=order.id if order else None, symbol=result.symbol, expected_quantity=result.expected_quantity, observed_quantity=result.observed_filled_quantity, status=result.status, action_taken=f"persisted before broker mirror synchronization; expected_position={result.expected_position}; observed_position={result.observed_position}", reconciled_at=result.last_reconciled_at))
             if cycle is not None:
@@ -778,6 +784,9 @@ class JsonOperationalRepository:
             self.audit.save(value)
 
     def save_reconciliation(self, result: Any) -> None:
+        decision = self.get(result.cycle_id)
+        if decision is not None and decision.execution_mode == "shadow":
+            return
         payload = asdict(result)
         payload["last_reconciled_at"] = result.last_reconciled_at.isoformat()
         path = self.audit.root / "reconciliations"
@@ -804,7 +813,7 @@ class JsonOperationalRepository:
             return str(latest_by_client.get(client_id, {}).get("status", "")).upper() in TERMINAL_ORDER_STATUSES
 
         for decision in self.list():
-            if decision.outcome not in {"PENDING_SUBMISSION", "UNKNOWN"} or (symbol and decision.symbol != symbol):
+            if decision.execution_mode == "shadow" or decision.outcome not in {"PENDING_SUBMISSION", "UNKNOWN"} or (symbol and decision.symbol != symbol):
                 continue
             intent = decision.execution_order or decision.proposed_order
             if intent and intent.client_order_id and not is_resolved(intent.client_order_id):
@@ -818,6 +827,8 @@ class JsonOperationalRepository:
             if payload.get("status") not in RECOVERABLE_RECONCILIATION_STATUSES or (symbol and payload.get("symbol") != symbol):
                 continue
             decision = self.get(payload.get("cycle_id", ""))
+            if decision is not None and decision.execution_mode == "shadow":
+                continue
             intent = decision.execution_order or decision.proposed_order if decision else None
             candidates.append({"cycle_id": payload.get("cycle_id") or client_id, "client_order_id": client_id, "symbol": payload.get("symbol"), "submitted_quantity": int(payload.get("expected_quantity", 0) or 0), "status": "MISMATCH", "expected_position": payload.get("expected_position"), "pre_trade_position": pre_trade_position(decision.portfolio_before, payload.get("symbol")) if decision else None, "side": intent.side if intent else None})
         return candidates

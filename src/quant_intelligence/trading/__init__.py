@@ -5,7 +5,7 @@ from .broker import PaperBroker
 from .broker import BrokerAccount, BrokerOrderStatus
 from .clock import FakeClock, SystemClock
 from .cycle import TradingCycleService
-from .models import SignalAction, TradingDecision
+from .models import ExecutionMode, SignalAction, TradingDecision
 from .scheduler import IntervalScheduler
 from .status import OperationalStatus, StatusStore
 from .alpaca import AlpacaBroker, AlpacaConfig, AlpacaConfigurationError, AlpacaMarketDataProvider, client_order_id_for_cycle
@@ -17,4 +17,4 @@ from .persistence import JsonOperationalRepository, PersistenceConfigurationErro
 from .runtime import CriticalResetError, CriticalRiskResetService, PersistentTraderService, RuntimeConfigurationError, ServiceAlreadyRunning, ServiceConfig, build_persistent_service
 from .risk import RiskConfig, RiskGate, RiskMode, RiskState, RiskStateService
 
-__all__ = ["AlpacaBroker", "AlpacaConfig", "AlpacaConfigurationError", "AlpacaMarketDataProvider", "AlpacaMarketSessionProvider", "AlpacaTradingAdapter", "AutonomousTrader", "BrokerAccount", "BrokerOrderStatus", "BrokerReconciliation", "CriticalResetError", "CriticalRiskResetService", "FakeClock", "FixtureMarketSessionProvider", "IntervalScheduler", "JsonOperationalRepository", "MarketSession", "MarketSessionProvider", "OperationalStatus", "PaperBroker", "PersistenceConfigurationError", "PersistentTraderService", "ReconciliationResult", "RobinhoodMCPClient", "RobinhoodMCPTransport", "RobinhoodTradingAdapter", "RuntimeConfigurationError", "ServiceAlreadyRunning", "ServiceConfig", "SignalAction", "SqlAlchemyOperationalRepository", "StatusStore", "SystemClock", "TradingCycleService", "TradingDecision", "RiskConfig", "RiskGate", "RiskMode", "RiskState", "RiskStateService", "build_persistent_service", "client_order_id_for_cycle", "operational_repository"]
+__all__ = ["AlpacaBroker", "AlpacaConfig", "AlpacaConfigurationError", "AlpacaMarketDataProvider", "AlpacaMarketSessionProvider", "AlpacaTradingAdapter", "AutonomousTrader", "BrokerAccount", "BrokerOrderStatus", "BrokerReconciliation", "CriticalResetError", "CriticalRiskResetService", "ExecutionMode", "FakeClock", "FixtureMarketSessionProvider", "IntervalScheduler", "JsonOperationalRepository", "MarketSession", "MarketSessionProvider", "OperationalStatus", "PaperBroker", "PersistenceConfigurationError", "PersistentTraderService", "ReconciliationResult", "RobinhoodMCPClient", "RobinhoodMCPTransport", "RobinhoodTradingAdapter", "RuntimeConfigurationError", "ServiceAlreadyRunning", "ServiceConfig", "SignalAction", "SqlAlchemyOperationalRepository", "StatusStore", "SystemClock", "TradingCycleService", "TradingDecision", "RiskConfig", "RiskGate", "RiskMode", "RiskState", "RiskStateService", "build_persistent_service", "client_order_id_for_cycle", "operational_repository"]

@@ -1,8 +1,6 @@
 import json
 from datetime import datetime, timezone
 
-from fastapi.testclient import TestClient
-
 from quant_intelligence.api.main import create_app
 from quant_intelligence.strategies import SmaTrendStrategy
 from quant_intelligence.trading.audit import TradingAuditStore
@@ -11,6 +9,7 @@ from quant_intelligence.trading.cycle import TradingCycleService
 from quant_intelligence.trading.market import FixtureMarketDataProvider
 from quant_intelligence.trading.risk import RiskConfig, RiskGate
 from quant_intelligence.trading.status import OperationalStatus, StatusStore
+from tests.helpers import make_test_client
 from tests.integration.test_trading import NOW, bars
 
 
@@ -27,11 +26,11 @@ def seed_trader(tmp_path):
     status = OperationalStatus(state="running")
     status.update_from_decision(decision)
     status_store.save(status)
-    return TestClient(create_app(tmp_path / "experiments", str(audit_dir), str(broker_path))), decision
+    return make_test_client(create_app(tmp_path / "experiments", str(audit_dir), str(broker_path))), decision
 
 
 def test_missing_trader_status_is_safe(tmp_path):
-    client = TestClient(create_app(tmp_path / "experiments", str(tmp_path / "audit"), str(tmp_path / "broker.json")))
+    client = make_test_client(create_app(tmp_path / "experiments", str(tmp_path / "audit"), str(tmp_path / "broker.json")))
     response = client.get("/api/trader/status")
     assert response.status_code == 200
     assert response.json()["available"] is False
@@ -54,7 +53,7 @@ def test_empty_portfolio_is_a_valid_read_only_response(tmp_path):
     audit_dir = tmp_path / "audit"
     status_store = StatusStore(audit_dir / "status.json")
     status_store.save(OperationalStatus(state="stopped", current_equity=1000, current_cash=1000))
-    client = TestClient(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
+    client = make_test_client(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
     portfolio = client.get("/api/trader/portfolio")
     assert portfolio.status_code == 200
     assert portfolio.json()["positions"] == []
@@ -80,7 +79,7 @@ def test_rejected_decision_summary_uses_proposed_intent_without_execution_fields
         audit_store=TradingAuditStore(audit_dir),
     ).run("SYNTH", NOW)
     assert decision.submitted_order is None and decision.proposed_order is not None
-    client = TestClient(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
+    client = make_test_client(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
     summary = client.get("/api/trader/decisions").json()[0]
     assert summary["order"] == {"side": "BUY", "quantity": 76, "status": None}
 
@@ -99,7 +98,7 @@ def test_corrupt_status_and_broker_state_are_handled_without_crashing(tmp_path):
     audit_dir.mkdir()
     (audit_dir / "status.json").write_text("{bad", encoding="utf-8")
     (tmp_path / "broker.json").write_text("{bad", encoding="utf-8")
-    client = TestClient(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
+    client = make_test_client(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
     assert client.get("/api/trader/status").status_code == 503
     assert client.get("/api/trader/portfolio").status_code == 503
 
@@ -108,6 +107,6 @@ def test_corrupt_audit_is_skipped_and_detail_is_safe(tmp_path):
     audit_dir = tmp_path / "audit"
     audit_dir.mkdir()
     (audit_dir / "corrupt.json").write_text("{bad", encoding="utf-8")
-    client = TestClient(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
+    client = make_test_client(create_app(tmp_path / "experiments", str(audit_dir), str(tmp_path / "broker.json")))
     assert client.get("/api/trader/decisions").json() == []
     assert client.get("/api/trader/decisions/corrupt").status_code == 503

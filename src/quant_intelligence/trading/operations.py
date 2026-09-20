@@ -38,7 +38,9 @@ def _decision_view(decision: Any) -> dict[str, Any]:
         "strategy": decision.strategy,
         "signal": _json(decision.signal),
         "signal_reason": decision.signal_reason,
+        "execution_mode": decision.execution_mode,
         "outcome": decision.outcome,
+        "broker_mutation": "none" if decision.execution_mode == "shadow" else ("submitted" if decision.submitted_order is not None else "none"),
         "risk": _json(decision.risk_decision),
         "proposed_order": _json(decision.proposed_order),
         "submitted_order": _json(decision.submitted_order),
@@ -117,12 +119,14 @@ def soak_summary(repository: Any, *, since: datetime | None = None, until: datet
         reconciliations = [item for item in reconciliations if in_range(item.get("reconciled_at"))]
         risk_events = [item for item in risk_events if in_range(item.get("created_at"))]
     sessions = [item.data_timestamp.date().isoformat() for item in selected if item.data_timestamp]
-    cycle_identities = [(item.strategy, str(item.strategy_parameters.get("version", "1")), item.symbol, session, "observation" if item.outcome.startswith("WOULD") else "paper_execution") for item, session in ((item, item.data_timestamp.date().isoformat() if item.data_timestamp else None) for item in selected) if session]
+    cycle_identities = [(item.strategy, str(item.strategy_parameters.get("version", "1")), item.symbol, session, item.execution_mode or ("observation" if item.outcome.startswith("WOULD") else "paper_execution")) for item, session in ((item, item.data_timestamp.date().isoformat() if item.data_timestamp else None) for item in selected) if session]
     duplicate_violations = sum(count - 1 for count in Counter(cycle_identities).values() if count > 1)
     return _json({
         "period": {"since": since, "until": until},
         "cycles": len(selected),
         "signals": dict(signals),
+        "execution_modes": dict(Counter(item.execution_mode or "unknown" for item in selected)),
+        "shadow_would_submit": sum(item.outcome == "SHADOW_WOULD_SUBMIT" for item in selected),
         "outcomes": dict(outcomes),
         "orders_proposed": sum(item.proposed_order is not None for item in selected),
         "orders_submitted": len(orders),

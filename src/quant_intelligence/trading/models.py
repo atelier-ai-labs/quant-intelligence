@@ -9,6 +9,15 @@ class SignalAction(StrEnum):
     HOLD = "HOLD"
 
 
+class ExecutionMode(StrEnum):
+    """Explicit cycle execution modes."""
+
+    OBSERVATION = "observation"
+    SHADOW = "shadow"
+    PAPER = "paper"
+    PAPER_EXECUTION = "paper_execution"
+
+
 class OrderStatus(StrEnum):
     SUBMITTED = "SUBMITTED"
     ACCEPTED = "ACCEPTED"

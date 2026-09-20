@@ -11,7 +11,7 @@ from .audit import TradingAuditStore
 from .broker import Broker, BrokerError, ExecutionDisabled, BrokerSubmissionUnknown, BrokerUnavailable
 from .clock import Clock, SystemClock
 from .market import MarketDataProvider, MarketDataUnavailable
-from .models import OrderIntent, PortfolioSnapshot, RiskDecision, SignalAction, TradingDecision
+from .models import ExecutionMode, OrderIntent, PortfolioSnapshot, RiskDecision, SignalAction, TradingDecision
 from .risk import RiskConfig, RiskGate, RiskMode
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,12 @@ class TradingCycleService:
     def __init__(self, *, strategy: SmaTrendStrategy, broker: Broker, market_data: MarketDataProvider, risk_gate: RiskGate, audit_store: TradingAuditStore, strategy_name: str = "sma_trend", strategy_version: str = "1", clock: Clock | None = None, execution_mode: str = "paper", max_execution_shares: int | None = None, risk_state_store: Any | None = None, risk_config: RiskConfig | None = None, risk_account_key: str = "default"):
         if max_execution_shares is not None and max_execution_shares < 1:
             raise ValueError("max_execution_shares must be positive")
-        self.strategy = strategy; self.broker = broker; self.market_data = market_data; self.risk_gate = risk_gate; self.audit_store = audit_store; self.strategy_name = strategy_name; self.strategy_version = strategy_version; self.clock = clock or SystemClock(); self.execution_mode = execution_mode; self.max_execution_shares = max_execution_shares; self.risk_state_store = risk_state_store; self.risk_config = risk_config or risk_gate.config; self.risk_account_key = risk_account_key
+        try:
+            self.execution_mode = ExecutionMode(execution_mode).value
+        except ValueError as exc:
+            supported = ", ".join(mode.value for mode in ExecutionMode)
+            raise ValueError(f"unsupported execution_mode {execution_mode!r}; expected one of: {supported}") from exc
+        self.strategy = strategy; self.broker = broker; self.market_data = market_data; self.risk_gate = risk_gate; self.audit_store = audit_store; self.strategy_name = strategy_name; self.strategy_version = strategy_version; self.clock = clock or SystemClock(); self.max_execution_shares = max_execution_shares; self.risk_state_store = risk_state_store; self.risk_config = risk_config or risk_gate.config; self.risk_account_key = risk_account_key
 
     def _cycle_id(self, symbol: str, data_timestamp: datetime, market_session: str | None = None) -> str:
         raw = json.dumps({"strategy": self.strategy_name, "version": self.strategy_version, "symbol": symbol, "market_session": market_session or data_timestamp.date().isoformat(), "data_timestamp": data_timestamp.isoformat(), "window": self.strategy.window, "execution_mode": self.execution_mode}, sort_keys=True)
@@ -104,6 +109,8 @@ class TradingCycleService:
         risk = self.risk_gate.evaluate(execution_intent, before, market.latest_price)
         if not risk.approved:
             return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, risk, None, None, before, "NO_TRADE", None, execution_intent, market_session=requested_session))
+        if self.execution_mode == ExecutionMode.SHADOW.value:
+            return self._save_decision(TradingDecision(cycle_id, timestamp, symbol, self.strategy_name, {"window": self.strategy.window}, market.data_timestamp, signal, reason, before, proposed_order, risk, None, None, before, "SHADOW_WOULD_SUBMIT", "shadow mode: broker mutation skipped", execution_intent, {"broker_mutation": "none", "reason": "shadow mode; broker submission skipped"}, requested_session))
         # Durable intent is written before an external submission. If this
         # transaction fails, no broker request is permitted to proceed.
         if self.execution_mode != "observation":
