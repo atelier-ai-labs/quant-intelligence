@@ -1,0 +1,11 @@
+# Tickers for the EDGAR risk-factor signal pipeline (research only; signals are intent-only and RiskGate-routed).
+# Mix of large caps and a few small caps. Raw filings are cached under data/edgar/ (gitignored).
+[edgar]
+tickers = ["AAPL", "MSFT", "NVDA", "JPM", "KO", "CAT", "WMT", "SOFI", "PLUG", "CRSR", "APPS", "UPWK", "TDOC", "CLOV", "OPEN"]
+form4_lookback_days = 180
+max_form4_filings = 40
+requests_per_second = 5.0
+
+[signals]
+min_confidence = 0.6
+order_quantity = 1

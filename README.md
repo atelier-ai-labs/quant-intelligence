@@ -217,6 +217,42 @@ The single-instance guard is a PostgreSQL session advisory lock, so it coordinat
 
 On WSL, systemd must be enabled by the host distribution. Windows sleep, restart, shutdown, or termination of the WSL VM stops the Linux service; systemd can restart it only after WSL itself resumes or starts. The application contains no WSL-specific trading logic and the same entrypoint/unit semantics are portable to a normal Linux host or a future container process supervisor.
 
+## EDGAR risk-factor signals with local Ollama (research, v0.7)
+
+An AI-engineering experiment in **evaluated, fail-closed LLM signals**, not a returns claim. It reads free SEC EDGAR filings, diffs a company's 10-K Risk Factors (Item 1A) year over year, and asks a local Ollama model to classify the change. The model's output is only accepted if it passes a pydantic schema and every citation is grounded verbatim in the text it was shown. The accepted signal can become an `OrderIntent`, which must pass `RiskGate`. Nothing here calls a broker.
+
+```
+EDGAR (free) ──> 10-K pair + Form 4s accepted ≤ as_of ──> Item 1A extract ──> paragraph diff
+      └─ data/edgar/ cache (gitignored)                                          │
+local Ollama (JSON-schema format) <── prompt: labelled diff excerpts + insider buys ┘
+      └─> pydantic validation ──> citation grounding ──> RiskSignal ──> OrderIntent ──> RiskGate.evaluate
+             any failure ⇒ neutral `no_signal` with a reason, logged to data/signals/replay.jsonl
+```
+
+Modules: `quant_intelligence.edgar` (rate-limited client, Item 1A extraction, diff, Form 4 parsing) and `quant_intelligence.signals` (schema, Ollama client, engine, OrderIntent/RiskGate mapping, CLI). Tickers live in `config/edgar_universe.toml`.
+
+Run one ticker end to end:
+
+```bash
+export SEC_USER_AGENT="Atelier AI Labs research you@example.com"   # required; the CLI refuses to run without it
+ollama serve & ollama pull llama3.2                                  # local only; no paid LLM APIs
+python -m quant_intelligence.signals.run --ticker AAPL               # add --as-of 2025-06-30T00:00:00+00:00 for a historical cutoff
+python -m quant_intelligence.signals.run --universe                  # every configured ticker
+```
+
+The CLI prints the filings used, diff stats, Form 4 open-market purchases (code `P`) in the lookback window, the signal, the derived intent, and the RiskGate decision against a hypothetical paper snapshot (`--paper-cash`, `--price`; without `--price` the gate is not satisfied).
+
+Safety properties:
+
+- **Point-in-time.** A signal's `as_of` is the newer 10-K's EDGAR acceptance timestamp (timezone-aware UTC). The prior 10-K and every Form 4 must have been accepted at or before `as_of`; Form 4s after it are never fetched, and the engine re-checks and refuses on any violation. `--as-of` restricts which 10-Ks are visible.
+- **Fail closed.** A missing User-Agent is a configuration error. EDGAR errors after retries, Item 1A not found (or only a table-of-contents hit), fewer than two 10-Ks, Ollama unreachable or timing out, non-JSON output, schema failure, an ungrounded citation, or a failed replay-log write all yield a neutral `no_signal` with a reason and no intent.
+- **Grounded citations.** Each citation must name an accession shown in the prompt, and its snippet must appear in the text shown for that accession (whitespace and curly quotes are normalized). Bullish or bearish output needs at least one citation.
+- **Intent-only.** Neutral output or confidence below `min_confidence` (0.6 by default) produces no intent. Bearish output only reduces an existing position, so the path never shorts. Intents go through `RiskGate.evaluate`, and the signal packages import no broker or execution module (a test checks this).
+- **Replayable.** Each run appends the prompt, the sources, the raw model output, the parsed payload, the final signal, the model, and a timestamp to `data/signals/replay.jsonl`.
+- **Fair access.** A descriptive User-Agent is required. Requests are limited to about 5 per second (the SEC limit is 10), with exponential backoff on 429 and 5xx responses. Raw filings are cached under `data/edgar/<TICKER>/<form>/<acceptance>_<accession>/`.
+
+Limitations: diffs cover only the paragraphs a small model can read (about 14 excerpts of up to 600 characters each). Small local models are noisy and often answer neutral. Item 1A extraction is heuristic and fails closed on unusual layouts. The feature has no event-study backtest, so it makes no claim about predictive value.
+
 ## Assumptions and methodology
 
 Signals for day `t` use only bars before day `t`; a 200-day SMA is calculated from closes through `t-1`, and changes execute at day `t` open. Buys use the maximum whole-share quantity affordable after the configured cost; fractional shares are disabled. Costs equal traded notional × bps / 10,000. The benchmark buys whole shares at the first selected bar's open, applies the same cost model, holds through the final close, and leaves residual cash idle.

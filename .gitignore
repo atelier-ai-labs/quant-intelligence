@@ -7,3 +7,6 @@ experiments/*.json
 data/*.csv
 .env
 alpaca_audit/
+# EDGAR raw filings cache and LLM signal replay logs (never commit downloaded data)
+data/edgar/
+data/signals/
