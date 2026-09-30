@@ -1,1 +1,0 @@
-Limitations: diffs cover only the paragraphs a small model can read (about 14 excerpts of up to 600 characters each). Small local models are noisy and often answer neutral (direction/rationale can contradict). Item 1A extraction is heuristic and fails closed on unusual layouts. Event-study go/no-go gate: see docs/EVENT_STUDY.md (`make event-study`; latest replay: NO-GO).
