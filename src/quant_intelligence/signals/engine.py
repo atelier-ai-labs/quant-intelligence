@@ -16,24 +16,38 @@ from quant_intelligence.edgar.client import FilingRef
 from quant_intelligence.edgar.diff import RiskFactorDiff
 from quant_intelligence.edgar.form4 import InsiderTransaction
 
+from .hardening import (
+    BEARISH_MIN_CONFIDENCE,
+    INSIDER_CLUSTER_MIN_DISTINCT,
+    INSIDER_CLUSTER_WINDOW_DAYS,
+    apply_hardening,
+)
 from .ollama import OllamaClient, OllamaError
-from .schema import LLMSignalPayload, RiskSignal, validate_citations
+from .schema import LLMSignalPayload, RiskSignal
 
 log = logging.getLogger(__name__)
-PROMPT_VERSION = "risk-diff-v1"
+# risk-diff-v2: citation-vs-diff + boilerplate reject + insider-cluster bullish gate + thin-evidence calibration.
+# Replay caches must not mix with v1 — find_cached_signal matches on this id.
+PROMPT_VERSION = "risk-diff-v2"
 MAX_ADDED, MAX_REMOVED, MAX_CHANGED, MAX_PARAGRAPH_CHARS = 6, 4, 4, 600
 
-SYSTEM_PROMPT = """You are a cautious equity research assistant. You read ONLY the SEC filing excerpts provided and \
+SYSTEM_PROMPT = f"""You are a cautious equity research assistant. You read ONLY the SEC filing excerpts provided and \
 classify whether the year-over-year (or consecutive-period) change in a company's Risk Factors section \
 (Form 10-K or 10-Q Item 1A) is bullish, bearish, or neutral for the stock.
 Rules:
 - Use only the provided text. No outside knowledge, no price predictions.
+- Cite ONLY real changes: snippets must be copied EXACTLY from [ADDED], [REMOVED], or [CHANGED] excerpts. \
+Never cite unchanged boilerplate that appears in both years.
 - Every citation must copy a short snippet (one sentence or clause, under 300 characters) EXACTLY, character for character, \
-from the provided text, and use the accession number shown in that excerpt's label.
-- Bullish or bearish requires at least one citation. If the evidence is mixed, boilerplate, or unclear, answer neutral with low confidence.
-- confidence is a number from 0 to 1.
-Respond with a single JSON object: {\"direction\": \"bullish\"|\"bearish\"|\"neutral\", \"confidence\": number, \"rationale\": string, \
-\"citations\": [{\"accession_no\": string, \"snippet\": string}]}."""
+from the provided Item 1A excerpts, and use the accession number shown in that excerpt's label. Do not cite Form 4 lines.
+- Bullish requires both (a) risk-text evidence that risks eased or improved and (b) clustered insider open-market buys \
+(≥{INSIDER_CLUSTER_MIN_DISTINCT} different insiders, Form 4 code P, within ~{INSIDER_CLUSTER_WINDOW_DAYS} days). \
+If insider cluster is missing, answer neutral — do not invent bullish.
+- Bearish requires clear risk-text worsening (prefer citing an [ADDED] risk) and confidence ≥ {BEARISH_MIN_CONFIDENCE} \
+unless the added-risk citation is strong. If evidence is mixed, thin, or unclear, answer neutral with low confidence.
+- confidence is a number from 0 to 1; use low confidence when evidence is thin.
+Respond with a single JSON object: {{\"direction\": \"bullish\"|\"bearish\"|\"neutral\", \"confidence\": number, \"rationale\": string, \
+\"citations\": [{{\"accession_no\": string, \"snippet\": string}}]}}."""
 
 
 class PointInTimeViolation(ValueError):
@@ -72,7 +86,12 @@ def _clip(text: str) -> str:
 
 
 def build_prompt(inputs: SignalInputs) -> tuple[list[dict[str, str]], dict[str, str]]:
-    """Return (chat messages, sources). sources maps accession -> exactly the text shown to the model for it."""
+    """Return (chat messages, sources).
+
+    sources maps Item 1A accession -> exactly the diff excerpt text shown to the model for it.
+    Form 4 lines are shown in the prompt for context but are intentionally excluded from
+    citation sources (risk-diff-v2: citations must be Item 1A YoY changes only).
+    """
     new_acc, old_acc = inputs.new_filing.accession_no, inputs.old_filing.accession_no
     new_form, old_form = inputs.new_filing.form, inputs.old_filing.form
     new_parts: list[str] = []; old_parts: list[str] = []; sections: list[str] = []
@@ -90,14 +109,18 @@ def build_prompt(inputs: SignalInputs) -> tuple[list[dict[str, str]], dict[str, 
     sources: dict[str, str] = {new_acc: "\n".join(new_parts), old_acc: "\n".join(old_parts)}
     buy_lines = []
     for buy in inputs.insider_buys:
-        line = buy.describe(); buy_lines.append(f"[FORM 4 {buy.accession_no}]\n{line}")
-        sources[buy.accession_no] = (sources.get(buy.accession_no, "") + "\n" + line).strip()
+        buy_lines.append(f"[FORM 4 {buy.accession_no}]\n{buy.describe()}")
     stats = inputs.diff.summary()
+    cluster_note = (
+        f"Insider-cluster rule for bullish: need ≥{INSIDER_CLUSTER_MIN_DISTINCT} distinct filers with "
+        f"open-market code-P buys accepted within {INSIDER_CLUSTER_WINDOW_DAYS} days before as_of."
+    )
     user = (
         f"Company ticker: {inputs.ticker}\n"
         f"Current {new_form}: {new_acc} accepted {inputs.as_of.isoformat()}\n"
         f"Prior {old_form}: {old_acc} accepted {inputs.old_filing.accepted_at.isoformat()}\n"
-        f"Risk Factors diff stats: {json.dumps(stats)}\n\n=== Risk Factors changes (excerpts) ===\n"
+        f"Risk Factors diff stats: {json.dumps(stats)}\n"
+        f"{cluster_note}\n\n=== Risk Factors changes (excerpts) ===\n"
         + "\n\n".join(sections)
         + f"\n\n=== Insider open-market purchases known as of the current {new_form} ===\n"
         + ("\n".join(buy_lines) if buy_lines else "None reported in the lookback window.")
@@ -117,7 +140,7 @@ def generate_signal(inputs: SignalInputs, client: OllamaClient, replay_log: str 
     """Always returns a RiskSignal; any failure yields status=no_signal (neutral, confidence 0) with a reason.
 
     When prefer_replay is True, reuse a prior JSONL record for the same (ticker, new, old) accession
-    pair without calling Ollama (sample expansion path).
+    pair *and* matching prompt_version (risk-diff-v2) without calling Ollama.
     """
     if prefer_replay:
         from quant_intelligence.event_study.replay import find_cached_signal
@@ -128,10 +151,12 @@ def generate_signal(inputs: SignalInputs, client: OllamaClient, replay_log: str 
             inputs.old_filing.accession_no,
             insider_buy_accessions=[b.accession_no for b in inputs.insider_buys],
             insider_buy_accepted_at=[b.accepted_at.isoformat() for b in inputs.insider_buys],
+            prompt_version=PROMPT_VERSION,
         )
         if cached is not None:
             log.info(
-                "replaying cached signal for %s %s->%s",
+                "replaying cached %s signal for %s %s->%s",
+                PROMPT_VERSION,
                 inputs.ticker,
                 inputs.old_filing.accession_no,
                 inputs.new_filing.accession_no,
@@ -144,7 +169,7 @@ def generate_signal(inputs: SignalInputs, client: OllamaClient, replay_log: str 
                               "new_form": inputs.new_filing.form, "old_form": inputs.old_filing.form,
                               "insider_buy_accessions": [b.accession_no for b in inputs.insider_buys],
                               "insider_buy_accepted_at": [b.accepted_at.isoformat() for b in inputs.insider_buys],
-                              "messages": None, "raw_output": None, "parsed": None}
+                              "messages": None, "raw_output": None, "parsed": None, "hardening_notes": None}
 
     def finish(signal: RiskSignal) -> RiskSignal:
         record["signal"] = signal.model_dump(mode="json")
@@ -183,7 +208,29 @@ def generate_signal(inputs: SignalInputs, client: OllamaClient, replay_log: str 
     except ValidationError as exc:
         return fail(f"schema validation failed: {exc.error_count()} error(s): {exc.errors()[0]['msg']}")
     record["parsed"] = payload.model_dump(mode="json")
-    citation_error = validate_citations(payload, sources)
-    if citation_error: return fail(f"citation rejected: {citation_error}")
-    return finish(RiskSignal(ticker=inputs.ticker, direction=payload.direction, confidence=payload.confidence, rationale=payload.rationale,
-                             citations=tuple(payload.citations), as_of=inputs.as_of, model=client.model, status="ok"))
+
+    decision = apply_hardening(
+        payload,
+        diff=inputs.diff,
+        new_accession=inputs.new_filing.accession_no,
+        old_accession=inputs.old_filing.accession_no,
+        prompt_sources=sources,
+        insider_buys=inputs.insider_buys,
+        as_of=inputs.as_of,
+    )
+    record["hardening_notes"] = list(decision.notes)
+    if decision.fail_reason:
+        return fail(decision.fail_reason)
+
+    return finish(
+        RiskSignal(
+            ticker=inputs.ticker,
+            direction=decision.direction,  # type: ignore[arg-type]
+            confidence=decision.confidence,
+            rationale=decision.rationale,
+            citations=tuple(payload.citations),
+            as_of=inputs.as_of,
+            model=client.model,
+            status="ok",
+        )
+    )
