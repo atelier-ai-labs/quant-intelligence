@@ -1,4 +1,4 @@
-.PHONY: test event-study event-study-live event-study-expand
+.PHONY: test event-study event-study-live event-study-expand event-study-redesign
 
 test:
 	python -m pytest -q
@@ -25,3 +25,12 @@ event-study-expand:
 		--replay-log data/signals/replay.jsonl \
 		--output-dir data/event_study \
 		--artifact docs/artifacts
+
+# Signal redesign v2: force Ollama (v1 replay is wrong prompt); same expanded universe + baselines
+event-study-redesign:
+	python -m quant_intelligence.event_study.run --live --universe --all-events --force-ollama \
+		--price-cache data/prices --allow-network \
+		--replay-log data/signals/replay.jsonl \
+		--output-dir data/event_study \
+		--artifact docs/artifacts \
+		-v
