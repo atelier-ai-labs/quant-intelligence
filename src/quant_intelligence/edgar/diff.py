@@ -25,6 +25,9 @@ class RiskFactorDiff:
     similarity: float
     old_paragraph_count: int = 0
     new_paragraph_count: int = 0
+    # Paragraphs present verbatim in both years (boilerplate). Used by risk-diff-v2
+    # citation hardening to reject snippets that also appear in unchanged text.
+    unchanged: tuple[str, ...] = ()
 
     def summary(self) -> dict[str, float | int]:
         return {"old_paragraphs": self.old_paragraph_count, "new_paragraphs": self.new_paragraph_count, "added": len(self.added),
@@ -47,12 +50,14 @@ def diff_paragraphs(old: list[str], new: list[str], threshold: float = DEFAULT_C
     if not 0 < threshold <= 1: raise ValueError("threshold must be in (0, 1]")
     unmatched_old: list[str] = []
     unmatched_new: list[str] = []
+    unchanged_paras: list[str] = []
     weighted = 0.0
     unchanged = 0
     remaining = Counter(old)
     for paragraph in new:
         if remaining[paragraph] > 0:
             remaining[paragraph] -= 1; unchanged += 1; weighted += 2 * len(paragraph)
+            unchanged_paras.append(paragraph)
         else:
             unmatched_new.append(paragraph)
     for paragraph in old:  # leftover old paragraphs, in document order
@@ -74,4 +79,5 @@ def diff_paragraphs(old: list[str], new: list[str], threshold: float = DEFAULT_C
         added=tuple(n for i, n in enumerate(unmatched_new) if i not in used_new),
         removed=tuple(o for i, o in enumerate(unmatched_old) if i not in used_old),
         changed=tuple(c for _, c in sorted(changed, key=lambda x: x[0])),
-        unchanged_count=unchanged, similarity=similarity, old_paragraph_count=len(old), new_paragraph_count=len(new))
+        unchanged_count=unchanged, similarity=similarity, old_paragraph_count=len(old), new_paragraph_count=len(new),
+        unchanged=tuple(unchanged_paras))
