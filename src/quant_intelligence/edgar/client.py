@@ -163,15 +163,25 @@ class SecClient:
         return json.loads(self.cached_get(SUBMISSIONS_URL.format(cik=cik), self.cache_dir / "submissions" / f"CIK{cik:010d}.json", refresh=refresh))
 
     def list_filings(self, ticker: str, forms: tuple[str, ...] = ("10-K", "4"), *, refresh: bool = True,
-                     min_10k: int = 2, max_extra_pages: int = 3) -> list[FilingRef]:
-        """Filings newest first. Large filers overflow `filings.recent`; older pages are loaded until min_10k 10-Ks are found."""
+                     min_10k: int = 2, min_10q: int = 0, max_extra_pages: int = 6) -> list[FilingRef]:
+        """Filings newest first. Large filers overflow `filings.recent`; older pages load until history quotas are met."""
         cik = self.ticker_to_cik(ticker)
         data = self.submissions(cik, refresh=refresh)
         filings = filings_from_submissions(ticker, cik, data, forms)
+
+        def _need_more() -> bool:
+            if "10-K" in forms and sum(f.form == "10-K" for f in filings) < min_10k:
+                return True
+            if "10-Q" in forms and min_10q > 0 and sum(f.form == "10-Q" for f in filings) < min_10q:
+                return True
+            return False
+
         for page in data.get("filings", {}).get("files", [])[:max_extra_pages]:
-            if "10-K" not in forms or sum(f.form == "10-K" for f in filings) >= min_10k: break
+            if not _need_more():
+                break
             name = str(page.get("name", ""))
-            if not re.fullmatch(r"CIK\d{10}-submissions-\d{3}\.json", name): continue
+            if not re.fullmatch(r"CIK\d{10}-submissions-\d{3}\.json", name):
+                continue
             older = json.loads(self.cached_get(f"https://data.sec.gov/submissions/{name}", self.cache_dir / "submissions" / name, refresh=refresh))
             filings += filings_from_submissions(ticker, cik, {"filings": {"recent": older}}, forms)
         filings.sort(key=lambda f: f.accepted_at, reverse=True)

@@ -1,4 +1,4 @@
-"""Extract 10-K Item 1A (Risk Factors) from EDGAR HTML using only the standard library."""
+"""Extract Item 1A (Risk Factors) from EDGAR 10-K/10-Q HTML using only the standard library."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ START_RE = re.compile(r"^\s*item\s*1a\s*[.:\-\u2013\u2014]?\s*(risk\s+factors)?\
 START_INLINE_RE = re.compile(r"^\s*item\s*1a\s*[.:\-\u2013\u2014]?\s*risk\s+factors\b", re.IGNORECASE)
 END_RE = re.compile(r"^\s*item\s*(1b|1c|2)\s*[.:\-\u2013\u2014]?\s*(unresolved\s+staff\s+comments|cybersecurity|properties)?\s*[.:]?\s*$", re.IGNORECASE)
 END_INLINE_RE = re.compile(r"^\s*item\s*(1b|1c|2)\s*[.:\-\u2013\u2014]?\s*(unresolved\s+staff\s+comments|cybersecurity|properties)\b", re.IGNORECASE)
-FOOTER_RE = re.compile(r"(form\s+10-k\s*\|\s*\d+$)|(^\d{1,3}$)|(^page\s+\d+)|(^table of contents$)", re.IGNORECASE)
+FOOTER_RE = re.compile(r"(form\s+10-[kq]\s*\|\s*\d+$)|(^\d{1,3}$)|(^page\s+\d+)|(^table of contents$)", re.IGNORECASE)
 MIN_SECTION_CHARS = 1500
 MIN_PARAGRAPH_CHARS = 40
 

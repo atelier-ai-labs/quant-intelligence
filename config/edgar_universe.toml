@@ -1,10 +1,25 @@
 # Tickers for the EDGAR risk-factor signal pipeline (research only; signals are intent-only and RiskGate-routed).
-# Mix of large caps and a few small caps. Raw filings are cached under data/edgar/ (gitignored).
+# Expanded small/mid-cap heavy universe for event-sample growth. Raw filings cached under data/edgar/ (gitignored).
 [edgar]
-tickers = ["AAPL", "MSFT", "NVDA", "JPM", "KO", "CAT", "WMT", "SOFI", "PLUG", "CRSR", "APPS", "UPWK", "TDOC", "CLOV", "OPEN"]
+tickers = [
+  # large / mid (history + liquidity)
+  "AAPL", "MSFT", "NVDA", "JPM", "KO", "CAT", "WMT", "CRM", "AMD", "INTC",
+  # prior small/mid set
+  "SOFI", "PLUG", "CRSR", "APPS", "UPWK", "TDOC", "CLOV", "OPEN",
+  # more small/mid caps with multi-year 10-K/10-Q history
+  "ROKU", "SNAP", "PINS", "HOOD", "AFRM", "RIVN", "LCID", "MARA", "RIOT",
+  "FUBO", "CHPT", "PATH", "U", "RBLX", "AI", "BYND", "LMND", "PTON",
+  "BMBL", "COUR", "FIGS", "JOBY", "SOUN",
+]
 form4_lookback_days = 180
 max_form4_filings = 40
 requests_per_second = 5.0
+# Event-sample expansion (PR #3): consecutive annual 10-K pairs + 10-Q Item 1A diffs
+max_10k_pairs = 4
+include_10q = true
+max_10q_events = 4
+min_10k_history = 6
+min_10q_history = 12
 
 [signals]
 min_confidence = 0.6

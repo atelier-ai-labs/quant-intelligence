@@ -59,12 +59,11 @@ def _write_outputs(result, output_dir: Path, *, write_markdown: bool) -> dict[st
 
 
 def _run_live(args: argparse.Namespace) -> list[RiskSignal]:
-    """Generate signals via the existing EDGAR→Ollama pipeline, then return RiskSignals."""
-    from quant_intelligence.edgar.client import SecClient, SecConfigurationError
+    """Generate signals via the EDGAR→Ollama pipeline (expanded multi-event by default), then return RiskSignals."""
+    from quant_intelligence.edgar.client import SecClient, SecConfigurationError, SecFetchError
     from quant_intelligence.signals.engine import generate_signal
-    from quant_intelligence.signals.ollama import OllamaClient
-    from quant_intelligence.signals.pipeline import PipelineError, build_inputs
-    from quant_intelligence.edgar.client import SecFetchError
+    from quant_intelligence.signals.ollama import OllamaClient, OllamaError
+    from quant_intelligence.signals.pipeline import PipelineError, build_event_inputs, build_inputs
 
     universe = load_universe(args.config)
     try:
@@ -80,25 +79,48 @@ def _run_live(args: argparse.Namespace) -> list[RiskSignal]:
     tickers = list(universe.tickers) if args.universe else [args.ticker.upper()]
     store = PriceStore(args.price_cache, allow_network=args.allow_network)
     signals: list[RiskSignal] = []
+    prefer_replay = not getattr(args, "force_ollama", False)
+    all_events = getattr(args, "all_events", True)
     for ticker in tickers:
         try:
-            inputs, _report = build_inputs(
-                sec,
-                ticker,
-                cutoff=args.as_of,
-                lookback_days=universe.form4_lookback_days,
-                max_form4=universe.max_form4_filings,
-            )
+            if all_events:
+                pairs = build_event_inputs(
+                    sec,
+                    ticker,
+                    cutoff=args.as_of,
+                    lookback_days=universe.form4_lookback_days,
+                    max_form4=universe.max_form4_filings,
+                    max_10k_pairs=universe.max_10k_pairs,
+                    include_10q=universe.include_10q,
+                    max_10q_events=universe.max_10q_events,
+                    min_10k_history=universe.min_10k_history,
+                    min_10q_history=universe.min_10q_history,
+                )
+            else:
+                pairs = [
+                    build_inputs(
+                        sec,
+                        ticker,
+                        cutoff=args.as_of,
+                        lookback_days=universe.form4_lookback_days,
+                        max_form4=universe.max_form4_filings,
+                    )
+                ]
         except (PipelineError, SecFetchError) as exc:
             logging.warning("pipeline failed for %s: %s", ticker, exc)
             continue
-        signal = generate_signal(inputs, ollama, args.replay_log)
-        try:
-            ref = as_of_reference_price(store, ticker, signal.as_of)
-            logging.info("as-of reference price for %s: %.4f", ticker, ref)
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("no reference price for %s: %s", ticker, exc)
-        signals.append(signal)
+        for inputs, report in pairs:
+            try:
+                signal = generate_signal(inputs, ollama, args.replay_log, prefer_replay=prefer_replay)
+            except OllamaError as exc:
+                logging.warning("ollama unavailable for %s %s: %s (fail closed)", ticker, report.event_kind, exc)
+                continue
+            try:
+                ref = as_of_reference_price(store, ticker, signal.as_of)
+                logging.info("as-of reference price for %s @ %s: %.4f", ticker, signal.as_of.date(), ref)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("no reference price for %s: %s", ticker, exc)
+            signals.append(signal)
     return signals
 
 
@@ -110,6 +132,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--live", action="store_true", help="generate signals with Ollama then study them")
     parser.add_argument("--ticker", help="with --live: single ticker")
     parser.add_argument("--universe", action="store_true", help="with --live: every configured ticker")
+    parser.add_argument("--all-events", action="store_true", default=True,
+                        help="with --live: consecutive 10-K pairs + 10-Q Item 1A diffs (default on)")
+    parser.add_argument("--latest-only", action="store_true", help="with --live: only the latest 10-K pair per ticker")
+    parser.add_argument("--force-ollama", action="store_true", help="ignore replay cache; call Ollama for every event")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--as-of", default=None, help="live mode point-in-time cutoff (ISO-8601 with tz)")
     parser.add_argument("--replay-log", default=os.environ.get("QI_SIGNAL_REPLAY_LOG", str(DEFAULT_REPLAY_LOG)))
@@ -124,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+    if getattr(args, "latest_only", False):
+        args.all_events = False
 
     if args.live:
         if not args.ticker and not args.universe:
