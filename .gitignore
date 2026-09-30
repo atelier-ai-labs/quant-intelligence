@@ -10,3 +10,7 @@ alpaca_audit/
 # EDGAR raw filings cache and LLM signal replay logs (never commit downloaded data)
 data/edgar/
 data/signals/
+# Free price cache for event study (Yahoo/Stooq downloads)
+data/prices/
+# Event-study run outputs (committed samples live under docs/artifacts/)
+data/event_study/
