@@ -88,8 +88,9 @@ def test_prompt_contains_only_labelled_diff_text_and_insider_buys():
     messages, sources = build_prompt(make_inputs())
     user = messages[1]["content"]
     assert f"[ADDED in 10-K {NEW_ACC}]" in user and f"[REMOVED, was in 10-K {OLD_ACC}]" in user and f"[FORM 4 {F4_ACC}]" in user
-    assert set(sources) == {NEW_ACC, OLD_ACC, F4_ACC}
-    assert "Doe Jane" in sources[F4_ACC]
+    # risk-diff-v2: Form 4 is shown in the prompt but excluded from citation sources
+    assert set(sources) == {NEW_ACC, OLD_ACC}
+    assert "Doe Jane" in user and F4_ACC not in sources
 
 
 # --- end-to-end signal generation (mocked Ollama) ----------------------------------------------
@@ -105,6 +106,7 @@ def test_valid_grounded_response_produces_signal_and_replay_record(tmp_path):
     [record] = read_log(log)
     assert record["raw_output"] == payload() and record["parsed"]["direction"] == "bearish" and record["model"] == "llama3.2"
     assert record["messages"][1]["content"] == sent["messages"][1]["content"] and record["signal"]["status"] == "ok"
+    assert record["prompt_version"] == "risk-diff-v2"
 
 
 @pytest.mark.parametrize("transport,reason", [
