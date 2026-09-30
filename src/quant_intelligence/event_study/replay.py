@@ -12,12 +12,17 @@ from quant_intelligence.signals.schema import RiskSignal
 DEFAULT_REPLAY_LOG = Path("data/signals/replay.jsonl")
 
 
-def load_replay_signals(path: str | Path = DEFAULT_REPLAY_LOG) -> list[RiskSignal]:
+def load_replay_signals(
+    path: str | Path = DEFAULT_REPLAY_LOG,
+    *,
+    prompt_version: str | None = None,
+) -> list[RiskSignal]:
     """Parse every line that contains a `signal` object into a RiskSignal.
 
     Lines without a signal payload are skipped. Order is file order (append order).
     When `new_accession` is present, duplicate (ticker, new_accession) pairs keep the last row.
     Rows without `new_accession` are never collapsed (fixture / legacy lines).
+    When prompt_version is set, only rows with that prompt_version are considered.
     """
     path = Path(path)
     if not path.exists():
@@ -31,6 +36,8 @@ def load_replay_signals(path: str | Path = DEFAULT_REPLAY_LOG) -> list[RiskSigna
             record = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(f"{path}:{line_no}: invalid JSON: {exc}") from exc
+        if prompt_version is not None and record.get("prompt_version") != prompt_version:
+            continue
         payload = record.get("signal")
         if payload is None:
             continue
@@ -71,11 +78,14 @@ def find_cached_signal(
     *,
     insider_buy_accessions: Iterable[str] | None = None,
     insider_buy_accepted_at: Iterable[str] | None = None,
+    prompt_version: str | None = None,
 ) -> RiskSignal | None:
     """Return the latest replayed RiskSignal for an exact accession pair (+ Form 4 set), or None.
 
     Used by generate_signal(prefer_replay=True) so expansion only calls Ollama for NEW filings.
     Form 4 accession + acceptance timestamps are part of the key (shown to the model / PIT).
+    When prompt_version is set (e.g. risk-diff-v2), only rows with that exact prompt_version match
+    — v1 caches must not be reused after a prompt redesign.
     """
     path = Path(path)
     if not path.exists():
@@ -93,6 +103,8 @@ def find_cached_signal(
         if str(record.get("ticker", "")).upper() != ticker_u:
             continue
         if record.get("new_accession") != new_accession or record.get("old_accession") != old_accession:
+            continue
+        if prompt_version is not None and record.get("prompt_version") != prompt_version:
             continue
         # Legacy rows (pre-expand) lack insider_buy_accepted_at - match on accessions only.
         if "insider_buy_accepted_at" not in record:
