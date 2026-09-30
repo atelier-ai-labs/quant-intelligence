@@ -26,9 +26,10 @@ event-study-expand:
 		--output-dir data/event_study \
 		--artifact docs/artifacts
 
-# Signal redesign v2: force Ollama (v1 replay is wrong prompt); same expanded universe + baselines
+# Signal redesign v2: force Ollama with risk-diff-v2 on expanded ticker universe.
+# Uses --latest-only (one 10-K pair / ticker) to match the PR #3 event-set budget (~60-85s/signal).
 event-study-redesign:
-	python -m quant_intelligence.event_study.run --live --universe --all-events --force-ollama \
+	python -m quant_intelligence.event_study.run --live --universe --latest-only --force-ollama \
 		--price-cache data/prices --allow-network \
 		--replay-log data/signals/replay.jsonl \
 		--output-dir data/event_study \
