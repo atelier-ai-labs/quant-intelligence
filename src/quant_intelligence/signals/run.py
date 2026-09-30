@@ -46,7 +46,16 @@ def run_ticker(ticker: str, args: argparse.Namespace, sec: SecClient, ollama: Ol
     now = datetime.now(timezone.utc)
     snapshot = PortfolioSnapshot(now, args.paper_cash, (), 0.0, args.paper_cash, 0.0)
     gate = RiskGate(RiskConfig(max_position_allocation=float(os.environ.get("QI_MAX_POSITION_ALLOCATION", 0.25)), max_order_notional=float(os.environ.get("QI_MAX_ORDER_NOTIONAL", 2500))))
-    routing = route_signal(signal, gate, snapshot, args.price, quantity=universe.order_quantity, min_confidence=universe.min_confidence)
+    price = args.price
+    if price is None:
+        try:
+            from quant_intelligence.event_study.prices import PriceStore, as_of_reference_price
+            price = as_of_reference_price(PriceStore(os.environ.get("QI_PRICE_CACHE_DIR", "data/prices"), allow_network=False), ticker, signal.as_of)
+            result["reference_price"] = price
+            result["reference_price_source"] = "yahoo-cache-as-of-entry-close"
+        except Exception as exc:  # noqa: BLE001 — price is optional; RiskGate still fails closed without it
+            result["reference_price_error"] = str(exc)
+    routing = route_signal(signal, gate, snapshot, price, quantity=universe.order_quantity, min_confidence=universe.min_confidence)
     result["intent"] = None if routing.intent is None else {"symbol": routing.intent.symbol, "side": routing.intent.side.value, "quantity": routing.intent.quantity, "reason": routing.intent.reason}
     result["risk_decision"] = {"approved": routing.decision.approved, "reason": routing.decision.reason}
     result["note"] = "research only: no broker was called; an approved decision would still need the existing execution layer"
