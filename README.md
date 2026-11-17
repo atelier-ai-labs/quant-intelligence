@@ -1,20 +1,48 @@
 # Quant Intelligence
 
-AI-assisted system that formulates, tests, challenges, and explains quantitative investment hypotheses using reproducible evidence.
+Quant Intelligence is my sandbox for testing trading ideas honestly. You give it an idea ("buy SPY when it's above its 200-day average, sit in cash when it isn't"), and it backtests the idea, shows you the evidence, and then trades it on a paper account so you can see how it behaves in the real market without risking real money.
 
-**Atelier AI — Experiment 002**
+It's Experiment 002 at Atelier AI. The long-term goal is an AI research assistant that can come up with hypotheses, test them, poke holes in them, and explain the results. Before any of that can be trusted, the boring parts have to be right: the math, the timing, the record-keeping, and the safety rails. That's what most of this repo is right now.
 
-> Build an AI-assisted quantitative research system that formulates, tests, challenges, and explains investment hypotheses using reproducible evidence.
+**No real money is involved.** Live trading is off by default and can't be turned on by accident.
 
-## Status
+## Where things stand (November 2026)
 
-Phase 1 research foundation plus a deterministic, local paper trader. No live-money trading, brokerage credentials, authentication, or live-data automation is included.
+- The backtester works for one stock or ETF on daily bars, with long-or-cash positions, whole shares, and simple transaction costs.
+- A paper trader runs every trading day against an [Alpaca](https://alpaca.markets/) paper account, using the same strategy and a strict risk gate.
+- All of the trader's state lives in PostgreSQL (I use Neon), so it survives restarts and never places the same order twice.
+- **Current milestone: v0.8 forward soak.** The service has been running since August 21. As of Nov 17 it has logged 43 daily cycles with no duplicate orders, no unresolved orders, no reconciliation problems, and no risk halts. Every decision so far has been HOLD, which is fine, because this phase is about proving the plumbing is reliable, not about making money.
+- **Next up:** finish collecting soak evidence across more sessions and restarts, then start v0.9, which is about smarter strategies.
 
-## Scope and architecture
+There's also a read-only Robinhood adapter in `trading/robinhood_adapter.py`. It was an experiment, it can't place orders, and it isn't wired into anything.
 
-Phase 1 supports daily US equity/ETF OHLCV data, long/cash states, one asset, integer shares, next-open execution, and configurable basis-point transaction costs. Responsibilities are separated into normalized data validation/providers, typed models, strategies, portfolio costs, the sequential backtest engine, metrics, benchmarks, and JSON experiment persistence.
+[`docs/PROJECT_STATE.md`](docs/PROJECT_STATE.md) has the detailed engineering state, and [`METHODOLOGY.md`](METHODOLOGY.md) explains exactly how the backtest math works.
 
-## Installation and usage
+## How it works
+
+Every trading day the paper trader goes through the same steps:
+
+1. **Wait for the market to close.** It uses Alpaca's market calendar and waits five extra minutes so it only ever sees completed daily bars. Today's half-finished candle never reaches the strategy.
+2. **Check in with the broker first.** Before deciding anything, it compares what it thinks it owns with what Alpaca says it owns. If they don't match, or it can't tell, it stops for the day.
+3. **Ask the strategy.** Right now that's a simple moving-average trend rule. The strategy only says what it *wants* to do. It can't place orders.
+4. **Run it through the risk gate.** The gate decides whether the trade is allowed: no position over 20% of equity, no leverage, a 5% daily loss breaker, and a hard stop at a 30% drawdown from the peak.
+5. **Submit, then confirm.** Every order gets an ID derived from the day's cycle, so a retry or restart can't send it twice. If a submission times out, the trader looks the order up instead of guessing.
+6. **Write everything down.** The decision, the risk check, the order, and the fill all go into the database, so you can trace any trade from start to finish.
+
+## The ground rules
+
+These matter more than any feature:
+
+- **Alpaca is the source of truth** for orders, fills, and positions. Quant Intelligence keeps its own copy, but it never trusts that copy over the broker.
+- **When in doubt, don't trade.** If the broker, the market data, the calendar, or the database looks off, the trader records a no-trade and halts. It doesn't guess.
+- **Strategies can't place orders.** Only the risk and execution layers can.
+- **The backend owns the numbers.** The dashboard displays results. It never recalculates returns or P&L on its own.
+- **Anything touching trading, risk, accounting, or persistence needs tests.**
+- **Live money stays off** unless someone deliberately and explicitly turns it on.
+
+## Getting started
+
+You'll need Python 3.11+ and Node (only if you want the dashboard).
 
 ```bash
 python -m venv .venv
@@ -23,7 +51,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Run a CSV-backed reference experiment:
+The test suite runs in a couple of seconds and doesn't need a database or any API keys.
+
+### Run a backtest
+
+Point it at a CSV with `date,open,high,low,close,volume` columns:
 
 ```bash
 quant-intelligence backtest --data data/SPY.csv --symbol SPY --window 200 \
@@ -31,20 +63,17 @@ quant-intelligence backtest --data data/SPY.csv --symbol SPY --window 200 \
   --transaction-cost-bps 5 --output experiments/spy.json
 ```
 
-The CSV must contain `date,open,high,low,close,volume`. The CLI prints a concise summary and persists the full audit result as JSON.
+You get a short summary in the terminal, and the full result (trades, equity curve, metrics, and a buy-and-hold comparison) is saved as JSON.
 
-## Application API and frontend
+### Open the dashboard
 
-The v0.1 API lives inside the Python package and provides a thin application boundary over the existing engine. It uses a filesystem-backed `experiments/` store, exposes only health/list/detail/create endpoints, and does not recalculate financial metrics. The frontend now reads experiment summaries and canonical results through this API rather than fetching persisted JSON directly.
-
-Start the API from the repository root:
+Start the API:
 
 ```bash
-source .venv/bin/activate
 uvicorn quant_intelligence.api.main:app --reload
 ```
 
-Then run the frontend:
+Then start the frontend in another terminal:
 
 ```bash
 cd frontend
@@ -53,9 +82,12 @@ cp .env.example .env.local
 npm run dev
 ```
 
-The API allows only the local Vite origins (`localhost:5173` and `127.0.0.1:5173`) through CORS. Set `VITE_API_BASE_URL` only when the API is hosted on a different origin; same-host local development uses the empty default. The frontend selects the newest persisted experiment from `GET /api/experiments`, then retrieves its canonical result from `GET /api/experiments/{experiment_id}`.
+Open `http://localhost:5173`. The dashboard has two views:
 
-Create an experiment through the API with a local CSV:
+- **Research** shows your latest backtest compared to buy-and-hold.
+- **Trader** is a read-only window into the paper trader: status, portfolio, and recent decisions, refreshed every 15 seconds. It has no buttons that place orders, on purpose.
+
+You can also create a backtest through the API:
 
 ```bash
 curl -X POST http://localhost:8000/api/experiments \
@@ -63,27 +95,15 @@ curl -X POST http://localhost:8000/api/experiments \
   -d '{"symbol":"SPY","strategy":"sma_trend","parameters":{"window":200},"start":"2015-01-01","end":"2025-12-31","initial_capital":10000,"transaction_cost_bps":5,"benchmark":"buy_and_hold","data_path":"./data/spy.csv"}'
 ```
 
-The backend result includes `benchmark_equity`, the dated buy-and-hold equity series required for a truthful comparison chart. The application remains intentionally local and filesystem-backed; no database or background job system is included.
+The API only accepts requests from the local Vite dev server. If the API runs somewhere else, set `VITE_API_BASE_URL` in the frontend. If the trader writes its files to a non-default location, point the API at them with `QI_PAPER_AUDIT_DIR` and `QI_PAPER_BROKER_STATE`.
 
-### Trader Operations Dashboard
+## Paper trading
 
-The React application includes a read-only `Trader` view. It observes the local paper trader through:
+### Try it offline first
 
-```text
-GET /api/trader/status
-GET /api/trader/portfolio
-GET /api/trader/decisions?limit=25
-GET /api/trader/decisions/{cycle_id}
-```
-
-The API reads the persisted `paper_audit/` records by default. Set `QI_PAPER_AUDIT_DIR` and `QI_PAPER_BROKER_STATE` when the paper trader uses another local directory. The dashboard polls status, portfolio, and recent decisions every 15 seconds. It has no order-entry controls and does not calculate signals, risk, fills, portfolio values, returns, or P&L.
-
-## Paper Trader v0.1
-
-The first paper-trading cycle is available as a deterministic CLI command. It uses completed local CSV bars, the existing SMA strategy, a fail-closed risk gate, an in-memory `PaperBroker`, and a JSON audit record. It does not schedule itself and does not connect to a brokerage.
+You can run one paper-trading cycle against a tiny sample file, with no broker and no network:
 
 ```bash
-source .venv/bin/activate
 quant-intelligence paper-cycle \
   --data tests/fixtures/paper_cycle.csv \
   --symbol SYNTH --window 3 --initial-capital 1000 \
@@ -92,24 +112,11 @@ quant-intelligence paper-cycle \
   --timestamp 2020-01-04T12:00:00+00:00
 ```
 
-The fixture proposes a cash-sized BUY at the completed close of 13, but v0.7 rejects that proposal because its resulting position would exceed the 20%-of-equity cap. The full rejection is persisted under the audit directory, and repeating the same cycle identity returns the prior decision rather than submitting a second order.
+In this example the strategy wants to buy, and the risk gate says no because the position would be bigger than 20% of the account. That's the point of the example. Run it again and you get the same decision back instead of a second order. `paper-run` does the same thing on a schedule, for a fixed number of cycles.
 
-For a finite scheduled run, use `paper-run`. It defaults to one scheduled cycle; `--cycles` makes the run explicitly bounded and Ctrl+C stops it cleanly:
+### Connect to Alpaca
 
-```bash
-quant-intelligence paper-run \
-  --data tests/fixtures/paper_cycle.csv \
-  --symbol SYNTH --window 3 --initial-capital 1000 \
-  --transaction-cost-bps 0 --cycles 1
-```
-
-The scheduler, clock, autonomous trader, and status persistence live under `quant_intelligence.trading`. They orchestrate `TradingCycleService`; they do not contain strategy or accounting logic.
-
-## Alpaca paper adapters v0.3
-
-Alpaca integration is edge-only: `AlpacaMarketDataProvider` converts completed daily bars into the existing `Bar`/`MarketDataSnapshot` types, while `AlpacaBroker` implements the existing broker boundary. The strategy, risk gate, cycle service, audit model, and dashboard do not depend on Alpaca SDK objects.
-
-Install the optional runtime dependency with `pip install -e ".[dev]"`. Configure credentials only through environment variables or a local ignored `.env` file:
+Copy `.env.example` to `.env` (it's git-ignored) and fill in your **paper** account keys:
 
 ```text
 APCA_API_KEY_ID=
@@ -119,178 +126,135 @@ APCA_EXECUTION_ENABLED=false
 APCA_DATA_FEED=iex
 ```
 
-`APCA_PAPER` must remain `true`. Execution is disabled by default. The adapter requests daily bars ending at the start of the current UTC date and filters out any bar dated today, so an incomplete current candle cannot reach the SMA strategy. The default `iex` feed is the free feed available to the configured account; it is not a claim that IEX-only data represents the full consolidated market.
+`APCA_PAPER` has to stay `true`. `APCA_EXECUTION_ENABLED=false` means the trader can look but can't submit orders. The `iex` feed is Alpaca's free data feed. It's good enough for daily bars, but it isn't the full consolidated market.
 
-Safe connectivity/data smoke test:
+Then work up to placing orders one step at a time:
 
 ```bash
+# 1. Can we reach Alpaca and pull data?
 quant-intelligence alpaca-data-check --symbol SPY --window 200
-```
 
-Observation mode is the default and never submits an order:
-
-```bash
+# 2. Run one cycle and show what it *would* do. Never places an order.
 quant-intelligence alpaca-cycle --symbol SPY --window 200 --observe
-```
 
-Paper execution requires both an explicit command flag and server-side configuration:
-
-```bash
-APCA_EXECUTION_ENABLED=true \
-quant-intelligence alpaca-cycle --symbol SPY --window 200 --execute
-```
-
-An Alpaca submission uses a stable client order ID derived from the Quant cycle ID. Known failures become no-trade decisions; timeouts/connection failures become `UNKNOWN` and are reconciled by client order ID without blind retry. Decisions expire while positions persist: a stale intent is never replayed after recovery. `BrokerReconciliation` records expected versus observed order/position state before any synchronization.
-
-## Alpaca autonomous forward paper trader v0.4
-
-`alpaca-run` evolves the existing `AutonomousTrader`; it does not introduce a second execution framework. It uses Alpaca's supported market calendar, waits until a completed daily session plus a five-minute safety delay, reconciles broker state before evaluating SMA, and persists the completed session, next decision, reconciliation state, and halt reason. A session identity is processed at most once, so restarting the process cannot replay the same daily order. The default forward-paper limits are 25% maximum position allocation, $2,500 maximum order notional, and 10 shares per order; all are configurable flags and execution remains disabled unless explicitly enabled.
-
-Use the no-order validation mode first:
-
-```bash
+# 3. Do a full dry run of the scheduler and reconciliation. Still no orders.
 quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
+
+# 4. Actually place paper orders. This needs the flag AND the setting.
+APCA_EXECUTION_ENABLED=true quant-intelligence alpaca-cycle --symbol SPY --window 200 --execute
 ```
 
-After reviewing its reconciliation and scheduling output, an operator can explicitly enable the bounded-risk paper service. v0.7 uses durable PostgreSQL risk state: resulting single-position exposure is capped at 20% of current equity, gross exposure and leverage at 1.0x, daily loss at 5%, and high-water drawdown at 30%. Daily halts reset only after reconciliation on a new valid market session; critical halts require an auditable operator reset. Future planned 1% per-trade risk is documented only, because this version has no stop/invalidation price and does not enforce it. The limits scale from equity; dollar examples are illustrative only.
+Pre-existing positions in the account that Quant Intelligence didn't buy are left alone. It will never sell something it didn't open.
 
-```bash
-quant-intelligence alpaca-run --symbol SPY --window 200
-```
+### Set up the database
 
-The service sleeps until the next Alpaca calendar decision time, handles Ctrl+C cleanly, and performs reconciliation-only wakeups while an order is unresolved. `TRADING HEALTH` is persisted separately from `PROCESS RUNNING`; broker, data, calendar, and reconciliation uncertainty halt trading fail-closed. v0.4 assumes a dedicated paper account or an explicitly managed symbol set. Existing positions without a persisted Quant fill are treated as unmanaged and are never liquidated by the strategy.
-
-## PostgreSQL operational persistence
-
-Autonomous operational state can be cut over independently of research JSON. Set `QI_TRADING_PERSISTENCE=postgres` and a standard PostgreSQL `DATABASE_URL`; credentials are never logged or sent to the frontend. The default `json` mode remains available during the transition and does not rewrite or delete existing JSON records.
+The long-running trader keeps its state in PostgreSQL. Any Postgres works; I use [Neon](https://neon.tech/).
 
 ```bash
 export QI_TRADING_PERSISTENCE=postgres
-export DATABASE_URL='postgresql+psycopg://user:password@localhost:5432/quant_intelligence'
+export DATABASE_URL='postgresql+psycopg://user:password@host:5432/quant_intelligence'
 alembic upgrade head
-uvicorn quant_intelligence.api.main:app --reload
-quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
 ```
 
-To roll back the latest schema revision, use `alembic downgrade -1`. The same `DATABASE_URL` format works with hosted PostgreSQL services such as Neon; no provider-specific API is required. The initial migration creates `trading_cycles`, `orders`, `fills`, `reconciliations`, `managed_positions`, and `operational_status`. Research/backtest result JSON remains file-based.
+`alembic downgrade -1` undoes the latest migration. The database URL and keys are never logged or sent to the dashboard. Backtest results are still plain JSON files in `experiments/`.
 
-## Forward-paper soak and operational proving v0.8
+## Running the trader for real (on paper)
 
-v0.8 adds read-only operator views and a small append-only lifecycle journal. It
-does not add strategy logic, execution controls, or a second audit store.
+`alpaca-service` is the long-running version. On startup it checks its config, connects to the database, takes a lock so only one copy can run at a time, and reconciles with Alpaca before doing anything else. Then it sleeps until the next market close, runs the cycle, and repeats.
 
-After applying migrations (`alembic upgrade head`), inspect durable state without
-contacting Alpaca or submitting an order:
+Run it in the foreground the first time so you can watch it:
 
 ```bash
-quant-intelligence trading-status --json
-quant-intelligence trading-activity --limit 25
-quant-intelligence trading-soak-summary --json
-```
-
-These commands distinguish unknown and halted state from healthy state. They
-read PostgreSQL only; they never reconcile, reset risk, schedule work, or place
-orders. Use `--since` and `--until` with inclusive UTC ISO timestamps to bound a
-soak report. The `operational_events` table records startup, persistence,
-advisory-lock, reconciliation-readiness, shutdown, and fatal-service evidence;
-cycles, orders, fills, reconciliations, and risk events remain authoritative in
-their existing tables.
-
-### Controlled WSL PAPER soak runbook
-
-Preflight in the project environment:
-
-```bash
-set -a; . /path/to/protected/quant-intelligence.env; set +a
+set -a; . /path/to/your/quant-intelligence.env; set +a
 alembic upgrade head
-test "$APCA_PAPER" = true
-test "$APCA_EXECUTION_ENABLED" = true
 quant-intelligence trading-status --json
 quant-intelligence alpaca-run --symbol "$QI_SYMBOL" --window "$QI_SMA_WINDOW" --dry-run-once
-```
-
-Start the supervised PAPER service in the foreground for the first run:
-
-```bash
 quant-intelligence alpaca-service
 ```
 
-Observe it with `quant-intelligence trading-status`,
-`quant-intelligence trading-activity --limit 25`, and
-`quant-intelligence trading-soak-summary --since 2026-01-01T00:00:00+00:00`.
-For systemd, use `systemctl status quant-intelligence` and
-`journalctl -u quant-intelligence -f`.
+`.env.example` lists every setting: the symbol, the SMA window, the risk limits, the post-close delay, and how often it re-checks an unresolved order.
 
-For a deliberate restart test, send SIGTERM (Ctrl+C in the foreground, or
-`sudo systemctl restart quant-intelligence`), wait for the old process to stop,
-then confirm a new startup, lock acquisition, startup reconciliation, and no
-second cycle/order for the already completed market session. Never use a bypass
-flag to recover from a halt.
+### As a systemd service
 
-If health becomes `UNKNOWN`, a daily or critical halt appears, reconciliation is
-unresolved, PostgreSQL is unavailable, or the advisory lock is unavailable, stop
-treating the soak as healthy. Preserve the evidence and inspect the broker and
-database independently; do not force orders. Use the audited risk-reset command
-only for an eligible critical halt after reconciliation.
-
-The empirical soak is successful only after multiple completed sessions show no
-duplicate decision/order, clean restart and lock behavior, durable risk state
-across restart, explainable reconciliation/risk events, and complete
-decision-to-broker traceability. Profitability is not an acceptance criterion.
-Windows sleep, shutdown, or WSL termination stops the runtime; the application
-contains no WSL-specific trading logic.
-
-## Persistent supervised paper service v0.6
-
-`alpaca-service` is the production-oriented, non-interactive entrypoint. It constructs the same `AutonomousTrader`, strategy, risk gate, reconciliation service, and Alpaca PAPER adapters used by `alpaca-run`. Startup validates configuration, checks PostgreSQL, acquires a PostgreSQL advisory lock, starts operational status, and reconciles Alpaca before any strategy cycle. The service checks persistence again before each strategy-triggering cycle and fails closed if durable state cannot be trusted.
-
-Copy `.env.example` to a protected environment file and supply real values outside Git. Required production settings are `QI_TRADING_PERSISTENCE=postgres`, `DATABASE_URL`, `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, `APCA_PAPER=true`, and an explicitly reviewed `APCA_EXECUTION_ENABLED=true`. Safe runtime settings include `QI_SYMBOL`, `QI_SMA_WINDOW`, the three risk caps, the post-close delay, and the reconciliation interval. Configuration errors never print credentials or the database URL.
-
-Run manually in the foreground first:
-
-```bash
-set -a
-. /path/to/protected/quant-intelligence.env
-set +a
-quant-intelligence alpaca-service
-```
-
-For a no-order connectivity and scheduling check, retain the existing debugging command:
-
-```bash
-quant-intelligence alpaca-run --symbol SPY --window 200 --dry-run-once
-```
-
-The deployment template is `deploy/quant-intelligence.service`. Install the Python package or virtual environment so `quant-intelligence` is on the service `PATH`, place the protected environment file at `/etc/quant-intelligence/quant-intelligence.env`, then install and manage the unit explicitly:
+There's a unit file in [`deploy/quant-intelligence.service`](deploy/quant-intelligence.service). It runs as its own unprivileged user, shuts down cleanly on SIGTERM, logs to the journal, and restarts after a crash with a 30-second delay.
 
 ```bash
 sudo useradd --system --home-dir /var/lib/quant-intelligence --shell /usr/sbin/nologin quant-intelligence
 sudo install -d -m 0750 /etc/quant-intelligence
-sudo install -m 0600 /path/to/protected/quant-intelligence.env /etc/quant-intelligence/quant-intelligence.env
+sudo install -m 0600 /path/to/your/quant-intelligence.env /etc/quant-intelligence/quant-intelligence.env
 sudo install -m 0644 deploy/quant-intelligence.service /etc/systemd/system/quant-intelligence.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now quant-intelligence.service
-sudo systemctl status quant-intelligence.service
-sudo journalctl -u quant-intelligence.service -f
-sudo systemctl restart quant-intelligence.service
-sudo systemctl stop quant-intelligence.service
-sudo systemctl disable quant-intelligence.service
 ```
 
-The unit runs as the unprivileged `quant-intelligence` service account, asks systemd to manage `/var/lib/quant-intelligence`, sends SIGTERM for graceful shutdown, records stdout/stderr in the journal, and restarts only after unexpected failure with a 30-second delay and a bounded start rate. It deliberately does not embed credentials, a personal username, repository path, or WSL behavior. Keep `QI_AUDIT_DIR=/var/lib/quant-intelligence/alpaca_audit` for this unit. If a virtual environment is not globally discoverable, set a safe `PATH` in the protected environment file or adapt `ExecStart` during deployment.
+Keep `QI_AUDIT_DIR=/var/lib/quant-intelligence/alpaca_audit` for this setup, and make sure `quant-intelligence` is on the service's `PATH`.
 
-The single-instance guard is a PostgreSQL session advisory lock, so it coordinates processes across WSL, Linux hosts, and containers that share the same database and lock name. The lock is released when its dedicated database connection closes; it is not a scheduler or leader-election system, and a future multi-account/distributed design will need explicit leases and fencing. Database and reconciliation failures distinguish a living process from halted trading.
+I run it on WSL. That works, but if Windows sleeps or shuts down, the trader stops with it, so for real uptime a normal Linux box or a container is better. Nothing in the code is WSL-specific.
 
-On WSL, systemd must be enabled by the host distribution. Windows sleep, restart, shutdown, or termination of the WSL VM stops the Linux service; systemd can restart it only after WSL itself resumes or starts. The application contains no WSL-specific trading logic and the same entrypoint/unit semantics are portable to a normal Linux host or a future container process supervisor.
+### Checking on it
 
-## Assumptions and methodology
+These commands only read from the database. They never contact Alpaca or place orders:
 
-Signals for day `t` use only bars before day `t`; a 200-day SMA is calculated from closes through `t-1`, and changes execute at day `t` open. Buys use the maximum whole-share quantity affordable after the configured cost; fractional shares are disabled. Costs equal traded notional × bps / 10,000. The benchmark buys whole shares at the first selected bar's open, applies the same cost model, holds through the final close, and leaves residual cash idle.
+```bash
+quant-intelligence trading-status --json        # is it healthy right now?
+quant-intelligence trading-activity --limit 25  # what happened recently?
+quant-intelligence trading-soak-summary         # the totals: cycles, orders, fills, halts
+```
 
-The internal convention is unadjusted OHLCV as supplied by the provider. Dividend treatment is therefore whatever the supplied series represents; this implementation does not infer or add dividends. Users must document whether their source is adjusted. Metrics annualize trading observations at 252 days. Sharpe assumes a configurable 0% annual risk-free rate in the current engine. CAGR requires more than one observation. These are simplifying assumptions, not claims about real execution.
+Add `--since` / `--until` (UTC timestamps) to the summary to look at a specific window. For the service itself, use `systemctl status quant-intelligence` and `journalctl -u quant-intelligence -f`.
 
-Backtested performance is hypothetical and does not represent actual trading results. Results must not be marketed as profitable trading strategies.
+### When something goes wrong
 
-## Known limitations and roadmap
+If health shows `UNKNOWN`, a halt appears, an order stays unresolved, or the database or lock is unavailable, stop and look before doing anything else. Check the broker and the database yourself. Don't force orders, and don't look for a bypass, because there isn't one.
 
-Phase 1 has no external provider adapter, corporate-action reconciliation, slippage model, fractional shares, multi-asset portfolios, shorting, leverage, intraday data, or AI interpretation. Future work should add provider adapters with explicit adjustment metadata, richer execution/cost models, property-based tests, experiment querying, and only then a constrained AI research layer that consumes the audit contract.
+- A **daily halt** clears on its own after a clean reconciliation on the next trading day.
+- A **critical halt** (the 30% drawdown stop) needs a person to reset it with `quant-intelligence alpaca-risk-reset`. The reset is logged, and it only works after reconciliation.
+
+To test restarts on purpose, restart the service (`sudo systemctl restart quant-intelligence`), then confirm it started up, took the lock, reconciled, and did **not** run a second cycle for a day it already handled.
+
+### What counts as a successful soak
+
+Profit isn't part of it. The soak passes when several trading days, with restarts mixed in, show:
+
+- no duplicate decisions or orders
+- clean restarts and lock handling
+- risk state that survives restarts
+- every reconciliation and risk event explained
+- every order traceable from decision to fill
+- enough in the status and activity logs to reconstruct what happened
+
+## Assumptions and limits
+
+Backtests are only as honest as their assumptions, so here are mine:
+
+- **No peeking.** Today's signal uses only data through yesterday's close. Trades fill at today's open.
+- **Whole shares only**, no shorting, no leverage, one asset at a time.
+- **Costs** are a flat basis-point charge on each trade. There's no modeling of slippage, spreads, or partial fills.
+- **Prices are used as given.** The code doesn't adjust for splits or dividends, so it's on you to know whether your data is adjusted.
+- **Metrics** assume 252 trading days a year and a 0% risk-free rate for Sharpe. If there isn't enough data for a metric to mean anything, it reports `null` instead of a made-up number.
+
+The full details are in [`METHODOLOGY.md`](METHODOLOGY.md).
+
+On the roadmap: better strategies (v0.9), richer cost and execution models, multiple assets, data sources that say whether prices are adjusted, and eventually the AI research layer that gives the project its name.
+
+## Project layout
+
+```text
+src/quant_intelligence/
+  data/          loading and validating price data
+  strategies/    trading rules (just the SMA trend rule for now)
+  backtest/      the backtest engine
+  portfolio/     transaction costs
+  metrics/       returns, volatility, Sharpe, drawdown
+  experiments/   saving and loading backtest results
+  trading/       paper trader: broker adapters, risk gate, reconciliation, scheduler, service
+  api/           FastAPI app behind the dashboard
+frontend/        React + Vite dashboard
+alembic/         database migrations
+deploy/          systemd unit
+tests/           unit and integration tests
+```
+
+## Disclaimer
+
+Backtest results are hypothetical and don't represent real trading. Nothing here is financial advice, and none of the results should be read as proof that a strategy makes money.
